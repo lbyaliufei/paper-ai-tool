@@ -1,0 +1,33 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Streamlit: Run Paper AI Tool",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/../.venv/bin/python",
+      "program": "${workspaceFolder}/scripts/vscode_streamlit_debug.py",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "subProcess": true,
+      "justMyCode": true
+    },
+    {
+      "name": "Python: Compile Check",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/../.venv/bin/python",
+      "module": "compileall",
+      "args": [
+        "."
+      ],
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "subProcess": false,
+      "justMyCode": true
+    }
+  ]
+}
