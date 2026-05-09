@@ -12,7 +12,11 @@ from .models import Figure
 from .utils import bytes_to_base64, ensure_dir
 
 
-CAPTION_RE = re.compile(r"^(Fig\.\s*\d+[A-Za-z]?|Figure\s+\d+[A-Za-z]?|Table\s+\d+[A-Za-z]?|图\s*\d+)", re.I)
+CAPTION_RE = re.compile(
+    r"^(Extended\s+Data\s+Fig\.?\s*\d+[A-Za-z]?|Fig\.?\s*\d+[A-Za-z]?|Figure\s+\d+[A-Za-z]?|"
+    r"Table\s+(?:\d+[A-Za-z]?|[IVXLCDM]+)|Scheme\s+\d+[A-Za-z]?|Chart\s+\d+[A-Za-z]?|Box\s+\d+[A-Za-z]?|图\s*\d+)",
+    re.I,
+)
 
 
 class FigureExtractor:
@@ -37,7 +41,10 @@ class FigureExtractor:
                 fig_id = self._normalize_id(match.group(1))
                 caption_blocks = self._caption_blocks(block, blocks)
                 caption = " ".join(b["text"] for b in caption_blocks)
-                bbox = self._infer_figure_bbox(page, block, blocks)
+                if self._caption_kind(fig_id) == "table":
+                    bbox = self._infer_table_bbox(page, block, blocks)
+                else:
+                    bbox = self._infer_figure_bbox(page, block, blocks)
                 target_page = page
                 target_page_num = page_num
                 if self._should_try_next_page(page, block) and page_num < len(doc):
@@ -76,19 +83,31 @@ class FigureExtractor:
     def _normalize_id(self, raw: str) -> str:
         raw = re.sub(r"\s+", " ", raw.strip())
         raw = re.sub(r"^Figure", "Fig.", raw, flags=re.I)
+        raw = re.sub(r"^Fig\s+", "Fig. ", raw, flags=re.I)
+        raw = re.sub(r"^Extended Data Fig\s+", "Extended Data Fig. ", raw, flags=re.I)
         return raw
+
+    def _caption_kind(self, figure_id: str) -> str:
+        if re.match(r"^Table\b", figure_id, re.I):
+            return "table"
+        if re.match(r"^(Scheme|Chart|Box)\b", figure_id, re.I):
+            return "graphic"
+        return "figure"
 
     def _looks_like_caption(self, text: str) -> bool:
         text = re.sub(r"\s+", " ", text).strip()
-        if not text or re.search(r"\bSupplementary\s+(?:Fig|Figure|Table)\b", text, re.I):
+        if not text or re.search(r"\b(Supplementary|Supporting)\s+(?:Fig|Figure|Table)\b", text, re.I):
             return False
         match = CAPTION_RE.match(text)
         if not match:
             return False
         raw_id = match.group(1)
-        number_match = re.search(r"(\d+)", raw_id)
-        number = int(number_match.group(1)) if number_match else 0
-        if number > 20:
+        if re.match(r"^Table\s+[IVXLCDM]+$", raw_id, re.I):
+            number = 1
+        else:
+            number_match = re.search(r"(\d+)", raw_id)
+            number = int(number_match.group(1)) if number_match else 0
+        if number > 80:
             return False
         rest = text[match.end() :].lstrip()
         if re.match(r"^[),;]", rest):
@@ -99,7 +118,13 @@ class FigureExtractor:
             return False
         if re.match(r"^[\|:：]\s*\S+", rest):
             return True
-        if re.match(r"^\.\s+(Overview|Characterization|Photovoltaic|Durability|Stability|Properties|Device|Figures of merit|Optoelectronic|Hole extraction|In-situ|The passivation|Performance)\b", rest, re.I):
+        if re.match(
+            r"^\.\s+(Overview|Characterization|Photovoltaic|Durability|Stability|Properties|Device|"
+            r"Figures of merit|Optoelectronic|Hole extraction|In-situ|The passivation|Performance|"
+            r"Summary|Comparison|Schematic|Architecture|Mechanism|Experimental|Structural|Electrical|Optical)\b",
+            rest,
+            re.I,
+        ):
             return True
         if re.match(r"^[-–]\s*\S+", rest):
             return True
@@ -177,6 +202,30 @@ class FigureExtractor:
             y0 = max(top_crop_min, cap_y0 - page_rect.height * 0.52)
             y1 = max(y0 + 80.0, cap_y0 - bottom_pad)
         return [x0, y0, x1, min(y1, page_rect.height - page_margin)]
+
+    def _infer_table_bbox(self, page: fitz.Page, caption_block: dict, blocks: list[dict]) -> list[float]:
+        page_rect = page.rect
+        cap_x0, cap_y0, cap_x1, cap_y1 = caption_block["bbox"]
+        same_page = [b for b in blocks if b["page"] == caption_block["page"] and b is not caption_block]
+        below = [b for b in same_page if b["bbox"][1] > cap_y1 + 6]
+        page_margin = 8.0
+        horizontal_pad = 34.0
+        y1 = page_rect.height - 44.0
+        next_caption_y = [
+            b["bbox"][1]
+            for b in below
+            if self._looks_like_caption(b["text"]) and b["bbox"][1] > cap_y1 + 30
+        ]
+        if next_caption_y:
+            y1 = min(next_caption_y) - 8.0
+        else:
+            dense_text = [b for b in below if b["bbox"][1] < cap_y1 + page_rect.height * 0.45]
+            if dense_text:
+                y1 = max(b["bbox"][3] for b in dense_text) + 8.0
+        x0 = max(page_margin, min(cap_x0 - horizontal_pad, page_rect.width * 0.015))
+        x1 = min(page_rect.width - page_margin, max(cap_x1 + horizontal_pad, page_rect.width * 0.985))
+        y0 = min(page_rect.height - 120.0, cap_y1 + 3.0)
+        return [x0, max(40.0, y0), x1, min(max(y0 + 80.0, y1), page_rect.height - page_margin)]
 
     def _should_try_next_page(self, page: fitz.Page, caption_block: dict) -> bool:
         cap_y0 = caption_block["bbox"][1]

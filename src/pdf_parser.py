@@ -9,9 +9,17 @@ import fitz
 from .models import PaperInfo, Paragraph, ParsedPaper, Section
 
 
-CAPTION_RE = re.compile(r"^(Fig\.\s*\d+[A-Za-z]?|Figure\s+\d+[A-Za-z]?|Table\s+\d+[A-Za-z]?|图\s*\d+)", re.I)
+CAPTION_RE = re.compile(
+    r"^(Extended\s+Data\s+Fig\.?\s*\d+[A-Za-z]?|Fig\.?\s*\d+[A-Za-z]?|Figure\s+\d+[A-Za-z]?|"
+    r"Table\s+(?:\d+[A-Za-z]?|[IVXLCDM]+)|Scheme\s+\d+[A-Za-z]?|Chart\s+\d+[A-Za-z]?|Box\s+\d+[A-Za-z]?|图\s*\d+)",
+    re.I,
+)
 SECTION_HINT_RE = re.compile(
-    r"^(Abstract|Introduction|Results|Discussion|Conclusion|Conclusions|Methods|Materials and methods|Experimental|References|Acknowledg|Supplementary|Data availability)\b",
+    r"^(Abstract|Introduction|Background|Results(?: and discussion)?|Discussion|Conclusion|Conclusions|"
+    r"Methods?|Materials and methods|Methodology|Experimental(?: section| details)?|"
+    r"References|Bibliography|Notes and references|Acknowledg(?:ement|ements)?|"
+    r"Supplementary|Data availability|Code availability|Appendix|Author contributions|"
+    r"Competing interests?|Conflict of interest|Conflicts of interest|Associated content|Supporting information)\b",
     re.I,
 )
 DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+\b", re.I)
@@ -25,11 +33,14 @@ NON_CONTENT_RE = re.compile(
     r"state key laboratory|e-mail:|these authors contributed equally|"
     r"www\.|https?://|"
     r"nature communications|nature energy|science|cell reports|joule|advanced materials|"
-    r"supplementary information|"
+    r"supplementary information|supporting information|associated content|"
+    r"science direct|sciencedirect|elsevier|article in press|available online|"
+    r"highlights|graphical abstract|keywords|index terms|nomenclature|"
+    r"open access|access metrics|article recommendations|"
     r"reporting summary|"
-    r"author contributions|competing interests|conflict of interest|"
+    r"author contributions|competing interests|conflict of interest|conflicts of interest|"
     r"data availability|code availability|"
-    r"references\b"
+    r"references\b|bibliography\b|notes and references\b"
     r")",
     re.I,
 )
@@ -41,6 +52,7 @@ class PDFParser:
 
     def parse(self, pdf_path: Path) -> tuple[ParsedPaper, list[dict]]:
         doc = fitz.open(pdf_path)
+        metadata = dict(doc.metadata or {})
         raw_blocks: list[dict] = []
         paragraphs: list[Paragraph] = []
         page_texts: list[str] = []
@@ -72,7 +84,7 @@ class PDFParser:
             doc.close()
 
         full_text = "\n\n".join(page_texts)
-        paper_info = self._extract_info(page_texts, paragraphs)
+        paper_info = self._extract_info(page_texts, paragraphs, metadata)
         self._mark_abstract_paragraph(paragraphs, paper_info.abstract)
         sections = self._build_sections(paragraphs)
         return ParsedPaper(paper_info=paper_info, sections=sections, figures=[], full_text=full_text), raw_blocks
@@ -114,46 +126,72 @@ class PDFParser:
             return False
         if not text or text[0].islower():
             return False
-        if re.match(r"^Supplementary\s+(?:Fig\.?|Figure|Table|Note)\b", text, re.I):
+        if re.match(r"^(Supplementary|Supporting)\s+(?:Fig\.?|Figure|Table|Note|Information)\b", text, re.I):
             return False
         section_match = SECTION_HINT_RE.match(text)
         if section_match:
             keyword = section_match.group(1)
-            if keyword.lower() == "supplementary":
+            low_keyword = keyword.lower()
+            if low_keyword in {
+                "supplementary",
+                "supporting information",
+                "associated content",
+                "author contributions",
+                "competing interest",
+                "competing interests",
+                "conflict of interest",
+                "conflicts of interest",
+            }:
                 return False
             rest = text[section_match.end() :].strip()
             if rest and not re.match(r"^[:.\-–]", rest):
-                inline_allowed = keyword.lower() in {
+                inline_allowed = low_keyword in {
                     "results",
+                    "results and discussion",
                     "discussion",
                     "conclusion",
                     "conclusions",
+                    "method",
                     "methods",
+                    "methodology",
                     "references",
+                    "bibliography",
+                    "notes and references",
                     "acknowledg",
+                    "acknowledgement",
                     "acknowledgements",
                     "data availability",
+                    "code availability",
                 }
                 if not inline_allowed:
                     return False
             return True
-        if re.match(r"^\d+\.?\s+(Introduction|Results|Discussion|Conclusion|Methods|Experimental)\b", text, re.I):
+        if re.match(r"^(?:\d+\.?|[IVXLCDM]+\.?)\s+(Introduction|Background|Results|Discussion|Conclusion|Methods|Methodology|Experimental)\b", text, re.I):
             return True
-        if re.match(r"^(Package Description|Package Testing|Outdoor Testing|Experimental Methods|Device Fabrication|Data Availability)\.?\b", text, re.I):
+        if re.match(
+            r"^(Package Description|Package Testing|Outdoor Testing|Experimental Methods|Experimental Details|"
+            r"Device Fabrication|Data Availability|Sample Preparation|Materials Characterization|"
+            r"Solar Cell Fabrication|Device Characterization)\.?\b",
+            text,
+            re.I,
+        ):
             return True
         return False
 
     def _looks_like_caption(self, text: str) -> bool:
         text = re.sub(r"\s+", " ", text).strip()
-        if not text or re.search(r"\bSupplementary\s+(?:Fig|Figure|Table)\b", text, re.I):
+        if not text or re.search(r"\b(Supplementary|Supporting)\s+(?:Fig|Figure|Table)\b", text, re.I):
             return False
         match = CAPTION_RE.match(text)
         if not match:
             return False
         raw_id = match.group(1)
-        number_match = re.search(r"(\d+)", raw_id)
-        number = int(number_match.group(1)) if number_match else 0
-        if number > 20:
+        if re.match(r"^Table\s+[IVXLCDM]+$", raw_id, re.I):
+            number = 1
+        else:
+            number_match = re.search(r"(\d+)", raw_id)
+            number = int(number_match.group(1)) if number_match else 0
+        if number > 80:
             return False
         rest = text[match.end() :].lstrip()
         if re.match(r"^[),;]", rest):
@@ -164,7 +202,13 @@ class PDFParser:
             return False
         if re.match(r"^[\|:：]\s*\S+", rest):
             return True
-        if re.match(r"^\.\s+(Overview|Characterization|Photovoltaic|Durability|Stability|Properties|Device|Figures of merit|Optoelectronic|Hole extraction|In-situ|The passivation|Performance)\b", rest, re.I):
+        if re.match(
+            r"^\.\s+(Overview|Characterization|Photovoltaic|Durability|Stability|Properties|Device|"
+            r"Figures of merit|Optoelectronic|Hole extraction|In-situ|The passivation|Performance|"
+            r"Summary|Comparison|Schematic|Architecture|Mechanism|Experimental|Structural|Electrical|Optical)\b",
+            rest,
+            re.I,
+        ):
             return True
         if re.match(r"^[-–]\s*\S+", rest):
             return True
@@ -201,10 +245,11 @@ class PDFParser:
             return True
         return False
 
-    def _extract_info(self, page_texts: list[str], paragraphs: list[Paragraph]) -> PaperInfo:
+    def _extract_info(self, page_texts: list[str], paragraphs: list[Paragraph], metadata: dict | None = None) -> PaperInfo:
         first_page = page_texts[0] if page_texts else ""
         doi_match = DOI_RE.search(first_page)
         publication = self._extract_publication_info("\n".join(page_texts[:4]))
+        metadata_title = self._clean_title_candidate((metadata or {}).get("title", "") or "")
         title = ""
         for p in paragraphs[:12]:
             t = p.text_original
@@ -220,11 +265,17 @@ class PDFParser:
                 break
             if self._looks_like_author_line(t):
                 continue
+        if (not title or self._looks_like_title_noise(title)) and 20 < len(metadata_title) < 260:
+            if not self._looks_like_title_noise(metadata_title) and not DOI_RE.search(metadata_title):
+                title = metadata_title
         abstract = ""
         abstract = self._extract_labeled_abstract(page_texts)
         if not abstract:
             abstract = self._guess_abstract_from_layout(paragraphs, title)
         authors = self._extract_authors(paragraphs, title)
+        if not authors and metadata:
+            metadata_author = metadata.get("author", "") or metadata.get("Author", "")
+            authors = self._parse_author_names(metadata_author)
         return PaperInfo(
             title=title,
             authors=authors,
@@ -239,7 +290,7 @@ class PDFParser:
 
     def _clean_title_candidate(self, text: str) -> str:
         text = re.sub(r"\s+", " ", text).strip(" .;:-")
-        text = re.sub(r"^(Article|Research Article|Original Article|ARTICLE IN PRESS)\b[:.\s-]*", "", text, flags=re.I).strip()
+        text = re.sub(r"^(Article|Research Article|Original Article|Review Article|Communication|Letter|ARTICLE IN PRESS|Open Access)\b[:.\s-]*", "", text, flags=re.I).strip()
         text = re.sub(r"^Nature Communications Article in Press\b[:.\s-]*", "", text, flags=re.I).strip()
         return text
 
@@ -247,7 +298,8 @@ class PDFParser:
         return bool(
             re.search(
                 r"^(Nature Communications Article in Press|ARTICLE IN PRESS|Received:|Accepted:|Published|Cite this|Cite This|"
-                r"We are providing|If this paper|Open Access|ACCESS Metrics|Check for updates|Supporting Information)\b",
+                r"We are providing|If this paper|Open Access|ACCESS Metrics|Check for updates|Supporting Information|"
+                r"ScienceDirect|Available online|Highlights|Graphical abstract|Keywords|Index Terms|Research Article|Review Article)\b",
                 text,
                 re.I,
             )
@@ -257,8 +309,12 @@ class PDFParser:
         text = "\n".join(page_texts[:8])
         text = re.sub(r"\s+", " ", text).strip()
         candidates = []
-        for match in re.finditer(r"\bAbstract\b\s*(.+?)(?=\bIntroduction\b|\bKeywords\b|\bResults\b|\bMethods\b|1\.\s*Introduction)", text, re.I | re.S):
-            candidate = re.sub(r"\s+", " ", match.group(1)).strip(" .:-")
+        stop = (
+            r"\b(?:Introduction|Keywords?|Index Terms|Background|Results|Methods?|Experimental|"
+            r"1\.\s*Introduction|I\.\s*Introduction|Highlights|Graphical Abstract)\b"
+        )
+        for match in re.finditer(rf"\bAbstract\b\s*(?:[-—:]\s*)?(.+?)(?={stop})", text, re.I | re.S):
+            candidate = re.sub(r"\s+", " ", match.group(1)).strip(" .:-—")
             if len(candidate) >= 120 and not re.match(r"^(ARTICLE IN PRESS|maximum power point)", candidate, re.I):
                 candidates.append(candidate)
         if candidates:
@@ -285,15 +341,61 @@ class PDFParser:
                 cleaned = re.sub(r"\b\d+(?:,\d+)*\b", "", cleaned)
                 cleaned = re.sub(r"\*|†|‡|§", "", cleaned)
                 cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;")
-                authors = [a.strip(" ,;") for a in re.split(r",|\s+&\s+|\s+and\s+", cleaned) if a.strip(" ,;")]
-                return authors[:40]
+                return self._parse_author_names(cleaned)
         return []
+
+    def _parse_author_names(self, text: str) -> list[str]:
+        cleaned = re.sub(r"\s+", " ", text or "").strip(" ,;")
+        if not cleaned:
+            return []
+        cleaned = re.sub(r"\b(?:and|&)\b", ",", cleaned)
+        cleaned = re.sub(r";", ",", cleaned)
+        authors = [a.strip(" ,;") for a in cleaned.split(",") if a.strip(" ,;")]
+        return [a for a in authors if 1 < len(a) < 80][:40]
 
     def _extract_publication_info(self, text: str) -> dict[str, str]:
         normalized = re.sub(r"\s+", " ", text).strip()
         info = {"journal": "", "volume": "", "issue": "", "pages": "", "year": ""}
         if not normalized:
             return info
+
+        ieee_match = re.search(
+            r"\b(?P<journal>IEEE\s+[A-Z][A-Z0-9 &/\-]+?)\s*,?\s+VOL\.?\s*(?P<volume>\d+[A-Za-z]?)"
+            r"(?:\s*,?\s+NO\.?\s*(?P<issue>\d+[A-Za-z]?))?.{0,80}?\b(?P<year>(?:19|20)\d{2})\b",
+            normalized,
+            re.I,
+        )
+        if ieee_match:
+            for key in info:
+                value = ieee_match.groupdict().get(key) or ""
+                info[key] = value.strip(" .,:;|")
+            info["journal"] = self._clean_journal_name(info["journal"])
+
+        citation_patterns = [
+            # Elsevier and many Springer PDFs: Journal Name 123 (2026) 123456
+            r"(?P<journal>[A-Z][A-Za-z0-9 &.,+\-/]{3,90}?)\s+(?P<volume>\d{1,4}[A-Za-z]?)\s*"
+            r"\((?P<year>(?:19|20)\d{2})\)\s*(?P<pages>[A-Za-z]?\d+(?:[-−–]\d+)?)",
+            # RSC/ACS/Wiley compact citations: Journal Name, 2026, 12, 1234-1245
+            r"(?P<journal>[A-Z][A-Za-z0-9 &.,+\-/]{3,90}?),\s*(?P<year>(?:19|20)\d{2}),\s*"
+            r"(?P<volume>\d{1,4}[A-Za-z]?)\s*,\s*(?P<pages>[A-Za-z]?\d+(?:[-−–]\d+)?|[A-Za-z]\d{4,})",
+            # MDPI style: Journal 2026, 18, 1234
+            r"(?P<journal>[A-Z][A-Za-z0-9 &.,+\-/]{3,90}?)\s+(?P<year>(?:19|20)\d{2}),\s*"
+            r"(?P<volume>\d{1,4}[A-Za-z]?)\s*,\s*(?P<pages>[A-Za-z]?\d+(?:[-−–]\d+)?|[A-Za-z]\d{4,})",
+            # Wiley style: Advanced Energy Materials 2026, 16, 2500000
+            r"(?P<journal>Adv(?:anced)?\.?\s+[A-Za-z &]+|Angew(?:andte)?\.?\s+[A-Za-z &]+|Small|Solar RRL)"
+            r"\s*,?\s*(?P<year>(?:19|20)\d{2})\s*,\s*(?P<volume>\d{1,4}[A-Za-z]?)"
+            r"\s*,\s*(?P<pages>[A-Za-z]?\d+(?:[-−–]\d+)?)",
+        ]
+        for pattern in citation_patterns:
+            if info["journal"] and info["year"]:
+                break
+            match = re.search(pattern, normalized, re.I)
+            if match and self._valid_journal_candidate(match.group("journal")):
+                for key in info:
+                    value = match.groupdict().get(key) or ""
+                    if value and not info[key]:
+                        info[key] = value.strip(" .,:;|").replace("−", "-").replace("–", "-")
+                info["journal"] = self._clean_journal_name(info["journal"])
 
         pipe_match = re.search(
             r"(?P<journal>[A-Z][A-Za-z0-9 &+\-]+?)\s*\|\s*\(?(?P<year>(?:19|20)\d{2})\)?\s*\|\s*"
@@ -316,20 +418,20 @@ class PDFParser:
             for key in info:
                 value = pipe_match.groupdict().get(key) or ""
                 info[key] = value.strip(" .,:;|")
+            info["journal"] = self._clean_journal_name(info["journal"])
 
         if not info["journal"]:
             journal_match = re.search(
                 r"\b(Nature Communications|Nature Photonics|Nature Energy|Science|Joule|Advanced Materials|Energy & Environmental Science|"
-                r"ACS Energy Letters|ACS Energy Lett\.|Nano Energy|Cell Reports Physical Science|Chemical Engineering Journal|Solar RRL|Nat Commun)\b",
+                r"ACS Energy Letters|ACS Energy Lett\.|Nano Energy|Cell Reports Physical Science|Chemical Engineering Journal|Solar RRL|Nat Commun|"
+                r"Advanced Energy Materials|Advanced Functional Materials|Angewandte Chemie|Journal of Materials Chemistry A|"
+                r"Energy & Environmental Materials|Matter|Chem|Device|Science Advances|PNAS|Small|Small Methods|"
+                r"IEEE [A-Z][A-Z0-9 &/\-]+|Applied Physics Letters|Physical Review [A-Z])\b",
                 normalized,
                 re.I,
             )
             if journal_match:
-                info["journal"] = journal_match.group(1)
-                if info["journal"].lower() == "nat commun":
-                    info["journal"] = "Nature Communications"
-                if info["journal"].lower() == "acs energy lett.":
-                    info["journal"] = "ACS Energy Letters"
+                info["journal"] = self._clean_journal_name(journal_match.group(1))
 
         acs_match = re.search(r"\bACS Energy Lett\.\s*((?:19|20)\d{2}),\s*(\d+),\s*([A-Za-z]?\d+(?:[-−–]\d+)?)", normalized, re.I)
         if acs_match:
@@ -377,6 +479,30 @@ class PDFParser:
             if year_match:
                 info["year"] = year_match.group(1) if year_match.lastindex else year_match.group(0)
         return info
+
+    def _clean_journal_name(self, journal: str) -> str:
+        cleaned = re.sub(r"\s+", " ", journal or "").strip(" .,:;|")
+        cleaned = re.sub(r"^(Cite This:|Original Article|Research Article|Article)\s*", "", cleaned, flags=re.I).strip()
+        aliases = {
+            "nat commun": "Nature Communications",
+            "acs energy lett": "ACS Energy Letters",
+            "acs energy lett.": "ACS Energy Letters",
+        }
+        return aliases.get(cleaned.lower(), cleaned)
+
+    def _valid_journal_candidate(self, journal: str) -> bool:
+        if not journal:
+            return False
+        if len(journal) > 100:
+            return False
+        return not bool(
+            re.search(
+                r"\b(Abstract|Introduction|Results|Discussion|Methods|References|Figure|Table|Supplementary|"
+                r"Received|Accepted|Published|Downloaded|Copyright|Open Access|Article in Press)\b",
+                journal,
+                re.I,
+            )
+        )
 
     def _looks_like_author_line(self, text: str) -> bool:
         if len(text) > 1200 or DOI_RE.search(text) or SECTION_HINT_RE.match(text):
@@ -430,7 +556,7 @@ class PDFParser:
             if para.kind == "abstract":
                 continue
             if para.kind == "non_content":
-                if re.search(r"^references\b|^bibliography\b", para.text_original, re.I):
+                if re.search(r"^(references|bibliography|notes and references)\b", para.text_original, re.I):
                     in_references = True
                 continue
             if para.kind == "heading":
@@ -438,7 +564,7 @@ class PDFParser:
                     sections.append(current)
                 title, remainder = self._split_inline_heading(para.text_original)
                 current = Section(section_title=title)
-                in_references = bool(re.search(r"^references\b|^bibliography\b", title, re.I))
+                in_references = bool(re.search(r"^(references|bibliography|notes and references)\b", title, re.I))
                 if remainder and not in_references:
                     para.kind = "paragraph"
                     para.text_original = remainder
@@ -527,8 +653,10 @@ class PDFParser:
                 r"Photovoltaic performance|Inhibition effect for iodide ion migration|Materials|"
                 r"Perovskite solar cells fabrication|Stability tests|Relative dielectric constant|"
                 r"Carrier concentration characterization|Space charge limited current|SCAPS simulation|"
-                r"Fitting of Fick|Characterization)\b",
+                r"Fitting of Fick|Characterization|Device fabrication|Sample preparation|Materials characterization|"
+                r"Solar cell fabrication|Device characterization|Experimental details|Synthesis)\b",
                 text,
+                re.I,
             )
         )
 
@@ -540,7 +668,9 @@ class PDFParser:
         if specific:
             return specific.group(1), specific.group(2).strip()
         match = re.match(
-            r"^(Abstract|Introduction|Results|Discussion|Conclusion|Conclusions|Methods|Materials and methods|Experimental|References|Acknowledg(?:ements)?|Supplementary|Data availability)\b[:.\s-]*(.*)$",
+            r"^(Abstract|Introduction|Background|Results(?: and discussion)?|Discussion|Conclusion|Conclusions|"
+            r"Methods?|Materials and methods|Methodology|Experimental(?: section| details)?|References|Bibliography|"
+            r"Notes and references|Acknowledg(?:ement|ements)?|Supplementary|Data availability|Code availability|Appendix)\b[:.\s-]*(.*)$",
             text,
             re.I,
         )
@@ -550,7 +680,8 @@ class PDFParser:
             return match.group(1), match.group(2).strip()
         extended = re.match(
             r"^(Package Description|Package Testing|Outdoor Testing|Experimental Methods|Device Fabrication|Fabrication of [^.]{5,80}|"
-            r"Stability Tests?|Characterization|Data Availability|Code Availability)\b[.:]?\s*(.*)$",
+            r"Stability Tests?|Characterization|Data Availability|Code Availability|Sample Preparation|Materials Characterization|"
+            r"Solar Cell Fabrication|Device Characterization|Synthesis|Film Deposition|Module Fabrication)\b[.:]?\s*(.*)$",
             text,
             re.I,
         )
@@ -562,7 +693,8 @@ class PDFParser:
         match = re.search(
             r"(?<=\.)\s+("
             r"Package Description|Package Testing|Outdoor Testing|Experimental Methods|Device Fabrication|"
-            r"Results and Discussion|Conclusions?"
+            r"Results and Discussion|Experimental Details|Sample Preparation|Materials Characterization|"
+            r"Solar Cell Fabrication|Device Characterization|Conclusions?"
             r")\.\s+",
             text,
             re.I,
