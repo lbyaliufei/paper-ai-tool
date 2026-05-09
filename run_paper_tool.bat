@@ -29,10 +29,16 @@ if not defined PYTHON_EXE (
 
 echo Python: %PYTHON_EXE%
 echo.
-echo Drag a PDF file into this window when prompted, then press Enter.
-echo.
+if "%~1"=="" (
+  echo Drag a PDF file into this window when prompted, then press Enter.
+  echo You can also drag a PDF file onto this .bat icon directly.
+  echo.
+) else (
+  echo Input arguments: %*
+  echo.
+)
 
-"%PYTHON_EXE%" cli.py
+"%PYTHON_EXE%" cli.py %*
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if not "%EXIT_CODE%"=="0" (
@@ -61,6 +67,10 @@ if exist "%SCRIPT_DIR%..\.venv\Scripts\python.exe" (
 )
 if exist "%SCRIPT_DIR%.venv\Scripts\python.exe" (
   set "PYTHON_EXE=%SCRIPT_DIR%.venv\Scripts\python.exe"
+  exit /b 0
+)
+if exist "D:\paper-ai-tool\.venv\Scripts\python.exe" (
+  set "PYTHON_EXE=D:\paper-ai-tool\.venv\Scripts\python.exe"
   exit /b 0
 )
 exit /b 0
