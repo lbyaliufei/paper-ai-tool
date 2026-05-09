@@ -74,11 +74,7 @@ class MarkdownWriter:
                 lines += ["", "<!-- 未能准确定位，按页面顺序补充的图 -->"]
                 self._append_figure(lines, fig)
 
-        lines += ["", "## 自动结构化总结", ""]
-        for row in structured.get("device_performance", [])[:20]:
-            lines.append(f"- 器件性能：PCE={row.get('pce_percent')}%，VOC={row.get('voc_v')} V，JSC={row.get('jsc_ma_cm2')}，FF={row.get('ff_percent')}；来源：{row.get('source_text','')[:160]}")
-        for row in structured.get("stability_tests", [])[:20]:
-            lines.append(f"- 稳定性：{row.get('test_type')}，保持率={row.get('retained_pce_operator','')}{row.get('retained_pce_percent')}%，时长={row.get('duration_h')} h；来源：{row.get('source_text','')[:160]}")
+        self._append_auto_structured_summary(lines, structured)
         output_path.write_text("\n".join(lines), encoding="utf-8")
 
     def write_summary(self, summary: str, output_path: Path) -> None:
@@ -108,6 +104,91 @@ code {{ background: #f5f5f5; padding: 1px 4px; }}
 </body>
 </html>"""
         html_path.write_text(html_doc, encoding="utf-8")
+
+    def _append_auto_structured_summary(self, lines: list[str], structured: dict[str, Any]) -> None:
+        lines += ["", "## 自动结构化总结", ""]
+
+        innovations = structured.get("key_innovations", []) or []
+        lines += ["### 核心创新点", ""]
+        if innovations:
+            for row in innovations[:8]:
+                text = row.get("innovation") or row.get("explanation") or row.get("source_text") or ""
+                lines.append(f"- {self._clean_summary_text(text)}")
+        else:
+            lines.append("- 未自动识别到明确创新点。")
+
+        methods = structured.get("experimental_methods", []) or []
+        lines += ["", "### 实验方法", ""]
+        if methods:
+            for row in methods[:10]:
+                name = row.get("method_name") or "实验方法"
+                desc = row.get("description") or row.get("source_text") or ""
+                page = self._page_suffix(row)
+                lines.append(f"- {name}：{self._clean_summary_text(desc)}{page}")
+        else:
+            lines.append("- 未自动识别到明确实验方法。")
+
+        perf = structured.get("device_performance", []) or []
+        lines += ["", "### 器件性能", ""]
+        if perf:
+            for row in perf[:20]:
+                metrics = []
+                if row.get("pce_percent") is not None:
+                    metrics.append(f"PCE={row.get('pce_percent')}%")
+                if row.get("certified_pce_percent") is not None:
+                    metrics.append(f"认证PCE={row.get('certified_pce_percent')}%")
+                if row.get("steady_state_pce_percent") is not None:
+                    metrics.append(f"稳态PCE={row.get('steady_state_pce_percent')}%")
+                if row.get("voc_v") is not None:
+                    metrics.append(f"VOC={row.get('voc_v')} V")
+                if row.get("jsc_ma_cm2") is not None:
+                    metrics.append(f"JSC={row.get('jsc_ma_cm2')} mA cm-2")
+                if row.get("ff_percent") is not None:
+                    metrics.append(f"FF={row.get('ff_percent')}%")
+                source = self._clean_summary_text(row.get("source_text", ""))
+                lines.append(f"- {'，'.join(metrics) or '检测到性能描述'}；角色：{row.get('sample_role') or 'unknown'}；来源：{source[:180]}{self._page_suffix(row)}")
+        else:
+            lines.append("- 未自动识别到明确器件性能数据。")
+
+        stability = structured.get("stability_tests", []) or []
+        lines += ["", "### 稳定性测试", ""]
+        if stability:
+            for row in stability[:20]:
+                duration = ""
+                if row.get("duration_h") is not None:
+                    duration = f"{row.get('duration_h')} h"
+                elif row.get("cycles") is not None:
+                    duration = f"{row.get('cycles')} cycles"
+                retained = ""
+                if row.get("retained_pce_percent") is not None:
+                    retained = f"，保持率={row.get('retained_pce_operator', '')}{row.get('retained_pce_percent')}%"
+                source = self._clean_summary_text(row.get("source_text", ""))
+                lines.append(f"- {row.get('test_type') or 'stability'}，{duration}{retained}；{row.get('qualitative_result') or ''}；来源：{source[:180]}{self._page_suffix(row)}")
+        else:
+            lines.append("- 未自动识别到明确稳定性测试数据。")
+
+        chars = structured.get("characterization_methods", []) or []
+        lines += ["", "### 表征手段", ""]
+        if chars:
+            for row in chars[:15]:
+                method = row.get("method") or "表征"
+                source = row.get("purpose") or row.get("key_finding") or row.get("source_text") or ""
+                lines.append(f"- {method}：{self._clean_summary_text(source)[:180]}{self._page_suffix(row)}")
+        else:
+            lines.append("- 未自动识别到明确表征手段。")
+
+    def _clean_summary_text(self, text: str) -> str:
+        return re.sub(r"\s+", " ", str(text or "")).strip(" ;.。")
+
+    def _page_suffix(self, row: dict[str, Any]) -> str:
+        page = row.get("source_page")
+        fig = row.get("source_figure")
+        parts = []
+        if page:
+            parts.append(f"p.{page}")
+        if fig:
+            parts.append(str(fig))
+        return f"（{'，'.join(parts)}）" if parts else ""
 
     def _append_figure(self, lines: list[str], fig: Figure) -> None:
         caption = fig.caption_zh or fig.caption_original

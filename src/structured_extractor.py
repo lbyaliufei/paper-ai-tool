@@ -36,19 +36,7 @@ class StructuredExtractor:
         self.max_chars = max_chars
 
     def extract(self, paper: ParsedPaper) -> dict[str, Any]:
-        data = empty_structured_data()
-        data["paper_info"] = paper.paper_info.__dict__.copy()
-        data["sections"] = [
-            {
-                "section_title": s.section_title,
-                "section_title_zh": s.section_title_zh,
-                "paragraphs": [p.__dict__ for p in s.paragraphs],
-            }
-            for s in paper.sections
-        ]
-        data["figures"] = [f.__dict__ for f in paper.figures]
-        data["warnings"] = list(paper.warnings)
-
+        data = self._base_data(paper)
         text = self._make_evidence_text(paper)[: self.max_chars]
         if self.llm.available():
             prompt = f"{SCHEMA_HINT}\n\n论文文本：\n{text}"
@@ -69,12 +57,39 @@ class StructuredExtractor:
             else:
                 data["warnings"].append("LLM structured extraction did not return valid JSON; heuristic extraction used.")
         heuristic = self._heuristic_extract(paper)
-        if not data["device_performance"]:
-            data["device_performance"] = heuristic["device_performance"]
-        if not data["stability_tests"]:
-            data["stability_tests"] = heuristic["stability_tests"]
-        if not data["characterization_methods"]:
-            data["characterization_methods"] = heuristic["characterization_methods"]
+        for key in [
+            "device_performance",
+            "stability_tests",
+            "experimental_methods",
+            "characterization_methods",
+            "key_innovations",
+            "new_knowledge",
+        ]:
+            if not data.get(key):
+                data[key] = heuristic.get(key, [])
+        return data
+
+    def extract_heuristic(self, paper: ParsedPaper) -> dict[str, Any]:
+        data = self._base_data(paper)
+        heuristic = self._heuristic_extract(paper)
+        for key, rows in heuristic.items():
+            data[key] = rows
+        data["warnings"].append("未运行 LLM 结构化抽取，自动结构化总结使用本地启发式结果。")
+        return data
+
+    def _base_data(self, paper: ParsedPaper) -> dict[str, Any]:
+        data = empty_structured_data()
+        data["paper_info"] = paper.paper_info.__dict__.copy()
+        data["sections"] = [
+            {
+                "section_title": s.section_title,
+                "section_title_zh": s.section_title_zh,
+                "paragraphs": [p.__dict__ for p in s.paragraphs],
+            }
+            for s in paper.sections
+        ]
+        data["figures"] = [f.__dict__ for f in paper.figures]
+        data["warnings"] = list(paper.warnings)
         return data
 
     def _make_evidence_text(self, paper: ParsedPaper) -> str:
@@ -92,28 +107,51 @@ class StructuredExtractor:
     def _heuristic_extract(self, paper: ParsedPaper) -> dict[str, Any]:
         device_rows: list[dict[str, Any]] = []
         stability_rows: list[dict[str, Any]] = []
+        method_rows: list[dict[str, Any]] = []
         char_rows: list[dict[str, Any]] = []
-        perf_re = re.compile(r"(?:(certified|steady-state|champion|average)\s+)?(?:PCE|efficiency)[^\n.;]{0,80}?([>~<≈≥≤]?\s*\d+(?:\.\d+)?)\s*%", re.I)
-        voc_re = re.compile(r"V(?:OC|oc|oc)?[^\d]{0,20}(\d+(?:\.\d+)?)\s*V", re.I)
-        jsc_re = re.compile(r"J(?:SC|sc)[^\d]{0,20}(\d+(?:\.\d+)?)\s*mA\s*cm[-−]?\s*2", re.I)
-        ff_re = re.compile(r"FF[^\d]{0,20}(\d+(?:\.\d+)?)\s*%", re.I)
+        innovation_rows: list[dict[str, Any]] = []
+        knowledge_rows: list[dict[str, Any]] = []
+        perf_re = re.compile(r"(?:(certified|steady-state|champion|average)\s+)?(?:PCE|efficiency|power conversion efficiency)[^\n.;]{0,120}?([>~<≈≥≤]?\s*\d+(?:\.\d+)?)\s*%", re.I)
+        reverse_perf_re = re.compile(r"([>~<≈≥≤]?\s*\d+(?:\.\d+)?)\s*%[^\n.;]{0,80}?(?:PCE|efficiency|power conversion efficiency)", re.I)
+        voc_re = re.compile(r"\bV(?:OC|oc)?\b[^\d]{0,20}(\d+(?:\.\d+)?)\s*V", re.I)
+        jsc_re = re.compile(r"\bJ(?:SC|sc)\b[^\d]{0,20}(\d+(?:\.\d+)?)\s*mA\s*cm[-−]?\s*2", re.I)
+        ff_re = re.compile(r"(?:\bFF\b|fill\s+factor)[^\d]{0,20}(\d+(?:\.\d+)?)\s*%", re.I)
         area_re = re.compile(r"(?:active\s+area|area)[^\d]{0,20}(\d+(?:\.\d+)?)\s*cm\s*2", re.I)
-        stability_re = re.compile(r"((?:retained|maintained|remaining|retain)[^.]{0,120}?([>~<≈≥≤]?\s*\d+(?:\.\d+)?)\s*%[^.]{0,120}?)(?:after|for)\s+(\d+(?:\.\d+)?)\s*(h|hours|hour|cycles)", re.I)
-        methods = ["XPS", "UPS", "SEM", "TEM", "AFM", "KPFM", "TRPL", "PL", "XRD", "GIWAXS", "ToF-SIMS", "EQE", "J-V", "MPP"]
-        items = [(p.source_page, p.text_original, "") for s in paper.sections for p in s.paragraphs if p.kind != "non_content"]
+        duration_num = r"\d[\d,]*(?:\.\d+)?"
+        stability_re = re.compile(rf"((?:retained|maintained|remaining|retain)[^. ]{{0,0}}[^.]{{0,160}}?([>~<≈≥≤]?\s*\d+(?:\.\d+)?)\s*%[^.]{{0,160}}?)(?:after|for)\s+({duration_num})\s*(h|hours|hour|cycles)", re.I)
+        reverse_stability_re = re.compile(rf"(?:after|for)\s+({duration_num})\s*(h|hours|hour|cycles)[^. ]{{0,0}}[^.]{{0,180}}?(?:retained|maintained|remaining|retain)[^.]{{0,120}}?([>~<≈≥≤]?\s*\d+(?:\.\d+)?)\s*%", re.I)
+        loss_re = re.compile(rf"(?:after|for)\s+({duration_num})\s*(h|hours|hour|cycles)[^. ]{{0,0}}[^.]{{0,180}}?(?:loss|lost|decrease|decreased|degradation)[^.]{{0,80}}?([>~<≈≥≤]?\s*\d+(?:\.\d+)?)\s*%", re.I)
+        methods = ["XPS", "UPS", "SEM", "TEM", "HRTEM", "AFM", "KPFM", "TRPL", "PL", "XRD", "GIWAXS", "ToF-SIMS", "SIMS", "EQE", "J-V", "MPP", "EL", "Raman", "FTIR", "UV-vis", "XAS"]
+        method_keywords = ["fabricat", "deposited", "spin-coat", "evaporation", "anneal", "sputter", "co-deposit", "ALD", "solution"]
+        innovation_keywords = ["we demonstrate", "we report", "we develop", "we introduce", "we design", "herein", "strategy", "approach", "novel", "enable"]
+        items = [(1, paper.paper_info.abstract, "")] if paper.paper_info.abstract else []
+        items += [(p.source_page, p.text_original, "") for s in paper.sections for p in s.paragraphs if p.kind != "non_content"]
         items += [(f.page, f.caption_original, f.figure_id) for f in paper.figures]
         for page, text, fig_id in items:
-            for m in perf_re.finditer(text):
+            if not text:
+                continue
+            for m in list(perf_re.finditer(text)) + list(reverse_perf_re.finditer(text)):
                 source = self._sentence_around(text, m.start())
-                op, pce = parse_operator_number(m.group(2))
+                if self._looks_like_stability_sentence(source):
+                    continue
+                op, pce = parse_operator_number(m.group(2) if m.re is perf_re else m.group(1))
                 row = self._empty_device_row()
+                label = ""
+                if m.re is perf_re and m.group(1):
+                    label = m.group(1)
+                elif re.search(r"\bchampion\b", source, re.I):
+                    label = "champion"
+                elif re.search(r"\bcertified\b", source, re.I):
+                    label = "certified"
+                elif re.search(r"\bsteady[- ]state\b", source, re.I):
+                    label = "steady-state"
                 row.update(
                     {
-                        "device_label": m.group(1) or "",
+                        "device_label": label,
                         "sample_role": self._role(source),
                         "pce_percent": pce,
-                        "certified_pce_percent": pce if (m.group(1) or "").lower() == "certified" else None,
-                        "steady_state_pce_percent": pce if "steady" in (m.group(1) or "").lower() else None,
+                        "certified_pce_percent": pce if label.lower() == "certified" else None,
+                        "steady_state_pce_percent": pce if "steady" in label.lower() else None,
                         "voc_v": self._float_match(voc_re.search(source)),
                         "jsc_ma_cm2": self._float_match(jsc_re.search(source)),
                         "ff_percent": self._float_match(ff_re.search(source)),
@@ -134,8 +172,8 @@ class StructuredExtractor:
                     {
                         "sample_role": self._role(source),
                         "test_type": self._test_type(source),
-                        "duration_h": float(m.group(3)) if m.group(4).lower().startswith("h") else None,
-                        "cycles": int(float(m.group(3))) if "cycle" in m.group(4).lower() else None,
+                        "duration_h": self._to_float_num(m.group(3)) if m.group(4).lower().startswith("h") else None,
+                        "cycles": int(self._to_float_num(m.group(3)) or 0) if "cycle" in m.group(4).lower() else None,
                         "retained_pce_operator": op,
                         "retained_pce_percent": retained,
                         "temperature_c": self._temperature(source),
@@ -147,13 +185,65 @@ class StructuredExtractor:
                     }
                 )
                 stability_rows.append(row)
+            for m in reverse_stability_re.finditer(text):
+                source = self._sentence_around(text, m.start())
+                op, retained = parse_operator_number(m.group(3))
+                row = self._empty_stability_row()
+                row.update(
+                    {
+                        "sample_role": self._role(source),
+                        "test_type": self._test_type(source),
+                        "duration_h": self._to_float_num(m.group(1)) if m.group(2).lower().startswith("h") else None,
+                        "cycles": int(self._to_float_num(m.group(1)) or 0) if "cycle" in m.group(2).lower() else None,
+                        "retained_pce_operator": op,
+                        "retained_pce_percent": retained,
+                        "temperature_c": self._temperature(source),
+                        "relative_humidity_percent": self._humidity(source),
+                        "source_text": source,
+                        "source_page": page,
+                        "source_figure": fig_id,
+                    }
+                )
+                stability_rows.append(row)
+            for m in loss_re.finditer(text):
+                source = self._sentence_around(text, m.start())
+                op, loss = parse_operator_number(m.group(2))
+                row = self._empty_stability_row()
+                row.update(
+                    {
+                        "sample_role": self._role(source),
+                        "test_type": self._test_type(source),
+                        "duration_h": self._to_float_num(m.group(1)) if m.group(2).lower().startswith("h") else None,
+                        "cycles": int(self._to_float_num(m.group(1)) or 0) if "cycle" in m.group(2).lower() else None,
+                        "retained_pce_operator": "~" if loss is not None else op,
+                        "retained_pce_percent": round(100 - loss, 3) if loss is not None else None,
+                        "temperature_c": self._temperature(source),
+                        "relative_humidity_percent": self._humidity(source),
+                        "qualitative_result": f"reported efficiency loss {op}{loss}%" if loss is not None else "",
+                        "source_text": source,
+                        "source_page": page,
+                        "source_figure": fig_id,
+                    }
+                )
+                stability_rows.append(row)
             for method in methods:
                 if re.search(rf"\b{re.escape(method)}\b", text, re.I):
                     char_rows.append({"method": method, "purpose": "", "key_finding": "", "source_text": self._sentence_around(text, text.lower().find(method.lower())), "source_page": page})
+            if any(k in text.lower() for k in method_keywords):
+                method_rows.append({"method_name": self._infer_method_name(text), "description": self._sentence_around(text, 0)[:260], "source_page": page})
+            if any(k in text.lower() for k in innovation_keywords):
+                source = self._sentence_around(text, 0)
+                innovation_rows.append({"innovation": source[:220], "explanation": "", "source_text": source, "source_page": page})
+            if re.search(r"\b(improve|enhance|suppress|reduce|increase|enable|reveal|confirm|indicate|demonstrate)\w*\b", text, re.I):
+                source = self._sentence_around(text, 0)
+                knowledge_rows.append({"finding": source[:220], "evidence": "", "source_text": source, "source_page": page})
         return {
             "device_performance": self._unique(device_rows, "source_text"),
             "stability_tests": self._unique(stability_rows, "source_text"),
+            "experimental_methods": self._unique(method_rows, "description"),
             "characterization_methods": self._unique(char_rows, "source_text"),
+            "key_innovations": self._unique(innovation_rows, "source_text")[:8],
+            "new_knowledge": self._unique(knowledge_rows, "source_text")[:10],
         }
 
     def _empty_device_row(self) -> dict[str, Any]:
@@ -165,13 +255,43 @@ class StructuredExtractor:
     def _sentence_around(self, text: str, pos: int) -> str:
         if pos < 0:
             pos = 0
-        start = max(text.rfind(".", 0, pos), text.rfind(";", 0, pos), 0)
-        end_dot = text.find(".", pos)
-        end = end_dot + 1 if end_dot > pos else min(len(text), pos + 260)
+        start = 0
+        for idx in range(pos - 1, -1, -1):
+            char = text[idx]
+            if char not in ".;!?":
+                continue
+            if self._is_decimal_point(text, idx):
+                continue
+            start = idx + 1
+            break
+        end = min(len(text), pos + 320)
+        for idx in range(pos, len(text)):
+            char = text[idx]
+            if char not in ".;!?":
+                continue
+            if self._is_decimal_point(text, idx):
+                continue
+            end = idx + 1
+            break
         return text[start:end].strip(" .;")
+
+    def _is_decimal_point(self, text: str, idx: int) -> bool:
+        return (
+            text[idx] == "."
+            and idx > 0
+            and idx + 1 < len(text)
+            and text[idx - 1].isdigit()
+            and text[idx + 1].isdigit()
+        )
 
     def _float_match(self, match: re.Match | None) -> float | None:
         return float(match.group(1)) if match else None
+
+    def _to_float_num(self, value: str) -> float | None:
+        try:
+            return float(str(value).replace(",", ""))
+        except (TypeError, ValueError):
+            return None
 
     def _role(self, text: str) -> str:
         if re.search(r"\b(control|reference)\b", text, re.I):
@@ -192,7 +312,31 @@ class StructuredExtractor:
             return "thermal"
         if "storage" in low:
             return "storage"
+        if "illumination" in low or "light soaking" in low or "1-sun" in low:
+            return "illumination"
         return "other"
+
+    def _looks_like_stability_sentence(self, text: str) -> bool:
+        return bool(
+            re.search(r"\b(retain(?:ed)?|maintain(?:ed)?|remaining|after|aging|stability|MPP tracking|cycles?|hours?|degradation|loss)\b", text, re.I)
+            and re.search(r"\binitial\s+PCE\b|\bof\s+their\s+initial\b|\bof\s+its\s+initial\b|\bafter\b", text, re.I)
+        )
+
+    def _infer_method_name(self, text: str) -> str:
+        low = text.lower()
+        if "fabricat" in low:
+            return "device fabrication"
+        if "spin" in low:
+            return "spin coating"
+        if "evaporation" in low or "evaporated" in low:
+            return "thermal evaporation"
+        if "co-deposit" in low:
+            return "co-deposition"
+        if "ald" in low or "atomic layer" in low:
+            return "atomic layer deposition"
+        if "sputter" in low:
+            return "sputtering"
+        return "experimental method"
 
     def _temperature(self, text: str) -> float | None:
         m = re.search(r"(\d+(?:\.\d+)?)\s*°?\s*C", text)

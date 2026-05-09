@@ -14,7 +14,6 @@ from .pdf_parser import PDFParser
 from .structured_extractor import StructuredExtractor
 from .summarizer import Summarizer
 from .translator import Translator
-from .models import empty_structured_data
 from .utils import ensure_dir, safe_slug, setup_logger, write_json
 
 
@@ -113,18 +112,8 @@ def process_pdf(
             report("抽取结构化器件性能和稳定性数据", 0.62)
             structured = StructuredExtractor(llm, logger, settings.max_llm_chars).extract(paper)
         else:
-            report("跳过结构化抽取", 0.62)
-            structured = empty_structured_data()
-            structured["paper_info"] = paper.paper_info.__dict__.copy()
-            structured["sections"] = [
-                {
-                    "section_title": s.section_title,
-                    "section_title_zh": s.section_title_zh,
-                    "paragraphs": [p.__dict__ for p in s.paragraphs],
-                }
-                for s in paper.sections
-            ]
-            structured["figures"] = [f.__dict__ for f in paper.figures]
+            report("生成本地启发式结构化摘要", 0.62)
+            structured = StructuredExtractor(llm, logger, settings.max_llm_chars).extract_heuristic(paper)
         structured["warnings"] = list({*structured.get("warnings", []), *paper.warnings})
 
         report("生成中文总结", 0.74)
