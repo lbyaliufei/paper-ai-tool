@@ -90,6 +90,15 @@ Windows：
 
 这两个脚本会自动优先使用项目根目录的 `.venv`，也兼容 `paper_ai_tool/.venv`。
 
+如果 Windows 双击后窗口仍然立刻关闭，通常是脚本没有在标准 `cmd.exe` 中运行。可以右键 `run_paper_tool.bat` 选择“在终端中打开”，或先打开 PowerShell / CMD 后执行：
+
+```bat
+cd /d C:\path\to\paper_ai_tool
+run_paper_tool.bat
+```
+
+新版 `run_paper_tool.bat` 会在启动时打印脚本目录、虚拟环境 Python 路径，并在错误时停留在窗口中，便于定位问题。
+
 指定输出目录：
 
 ```bash

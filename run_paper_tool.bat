@@ -1,27 +1,66 @@
 @echo off
-setlocal
+setlocal EnableExtensions
+chcp 65001 >nul
+title AI Paper Tool
 
-cd /d "%~dp0"
+set "SCRIPT_DIR=%~dp0"
+cd /d "%SCRIPT_DIR%"
 
-if exist "..\.venv\Scripts\python.exe" (
-  set "PYTHON=..\.venv\Scripts\python.exe"
-) else if exist ".venv\Scripts\python.exe" (
-  set "PYTHON=.venv\Scripts\python.exe"
-) else (
-  echo 未找到虚拟环境 Python。
-  echo 请先在项目根目录执行：
-  echo python -m venv .venv
-  echo .venv\Scripts\activate
-  echo pip install -r paper_ai_tool\requirements.txt
+echo AI Paper Tool Windows Launcher
+echo Script dir: %SCRIPT_DIR%
+echo.
+
+call :find_python
+if not defined PYTHON_EXE (
+  echo [ERROR] Cannot find virtual environment Python.
+  echo.
+  echo Checked:
+  echo   %SCRIPT_DIR%..\.venv\Scripts\python.exe
+  echo   %SCRIPT_DIR%.venv\Scripts\python.exe
+  echo.
+  echo Please run these commands from the project root:
+  echo   python -m venv .venv
+  echo   .venv\Scripts\activate
+  echo   pip install -r paper_ai_tool\requirements.txt
   echo.
   pause
   exit /b 1
 )
 
-echo AI 论文处理工具
-echo 当前目录：%CD%
+echo Python: %PYTHON_EXE%
 echo.
-"%PYTHON%" cli.py
+echo Drag a PDF file into this window when prompted, then press Enter.
+echo.
 
+"%PYTHON_EXE%" cli.py
+set "EXIT_CODE=%ERRORLEVEL%"
+
+if not "%EXIT_CODE%"=="0" (
+  echo [ERROR] Program exited with code %EXIT_CODE%.
+  echo The error output above should show the cause.
+  echo.
+  pause
+  exit /b %EXIT_CODE%
+)
+
+echo Done.
 echo.
 pause
+exit /b 0
+
+:find_python
+if defined PAPER_AI_TOOL_PYTHON (
+  if exist "%PAPER_AI_TOOL_PYTHON%" (
+    set "PYTHON_EXE=%PAPER_AI_TOOL_PYTHON%"
+    exit /b 0
+  )
+)
+if exist "%SCRIPT_DIR%..\.venv\Scripts\python.exe" (
+  set "PYTHON_EXE=%SCRIPT_DIR%..\.venv\Scripts\python.exe"
+  exit /b 0
+)
+if exist "%SCRIPT_DIR%.venv\Scripts\python.exe" (
+  set "PYTHON_EXE=%SCRIPT_DIR%.venv\Scripts\python.exe"
+  exit /b 0
+)
+exit /b 0
