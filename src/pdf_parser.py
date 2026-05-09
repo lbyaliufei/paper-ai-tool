@@ -53,23 +53,26 @@ class PDFParser:
     def parse(self, pdf_path: Path) -> tuple[ParsedPaper, list[dict]]:
         doc = fitz.open(pdf_path)
         metadata = dict(doc.metadata or {})
+        preview_mode = self._is_accelerated_preview(doc)
         raw_blocks: list[dict] = []
         paragraphs: list[Paragraph] = []
         page_texts: list[str] = []
         try:
             for page_index, page in enumerate(doc, start=1):
                 blocks = page.get_text("blocks")
-                blocks = self._sort_page_blocks(blocks, page.rect)
+                blocks = self._sort_page_blocks(blocks, page.rect, preview_mode)
                 page_parts: list[str] = []
                 for block in blocks:
                     x0, y0, x1, y1, text, *_ = block
-                    clean = self._clean_text(text)
+                    clean = self._clean_text(text, strip_line_numbers=preview_mode and page_index > 1)
                     if not clean:
                         continue
                     if self._is_repeated_margin_block(clean, [x0, y0, x1, y1], page.rect):
                         kind = "non_content"
                     else:
                         kind = "caption" if self._looks_like_caption(clean) else ("heading" if self._looks_like_heading(clean) else "paragraph")
+                    if preview_mode and page_index <= 2 and self._looks_like_preview_front_matter(clean):
+                        kind = "non_content"
                     item = {"page": page_index, "bbox": [x0, y0, x1, y1], "text": clean, "page_rect": list(page.rect)}
                     raw_blocks.append(item)
                     page_parts.append(clean)
@@ -78,18 +81,29 @@ class PDFParser:
                     if page_index == 1 and y0 < page.rect.height * 0.35 and self._looks_like_author_line(clean):
                         kind = "non_content"
                     paragraphs.append(Paragraph(source_page=page_index, text_original=clean, bbox=[x0, y0, x1, y1], kind=kind))
-                raw_text = self._clean_text(page.get_text("text"))
+                raw_text = self._clean_text(page.get_text("text"), strip_line_numbers=preview_mode and page_index > 1)
                 page_texts.append(raw_text or "\n".join(page_parts))
         finally:
             doc.close()
 
         full_text = "\n\n".join(page_texts)
-        paper_info = self._extract_info(page_texts, paragraphs, metadata)
+        paper_info = self._extract_info(page_texts, paragraphs, metadata, preview_mode)
+        if preview_mode and paper_info.title:
+            for para in paragraphs:
+                if para.source_page <= 2 and para.text_original == paper_info.title:
+                    para.kind = "non_content"
         self._mark_abstract_paragraph(paragraphs, paper_info.abstract)
         sections = self._build_sections(paragraphs)
+        if preview_mode and not paper_info.abstract:
+            merged_paragraphs = [p for section in sections for p in section.paragraphs]
+            paper_info.abstract = self._guess_abstract_from_preview_manuscript(merged_paragraphs, paper_info.title)
         return ParsedPaper(paper_info=paper_info, sections=sections, figures=[], full_text=full_text), raw_blocks
 
-    def _clean_text(self, text: str) -> str:
+    def _is_accelerated_preview(self, doc: fitz.Document) -> bool:
+        sample = "\n".join(doc[i].get_text("text") for i in range(min(5, len(doc))))
+        return bool(re.search(r"ACCELERATED\s+ARTICLE\s+PREVIEW|Accelerated Article Preview", sample, re.I))
+
+    def _clean_text(self, text: str, strip_line_numbers: bool = False) -> str:
         text = text.replace("\x00", " ")
         text = text.replace("\x01", "-")
         text = text.translate(str.maketrans({"ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl"}))
@@ -97,11 +111,15 @@ class PDFParser:
         text = re.sub(r"ffiffi(?:ffi)*\s*([A-Za-z0-9]+)\s*p", r"sqrt(\1)", text)
         text = re.sub(r"(?<=\d)(°C|°F|K|h|hours|min|s)", r" \1", text)
         text = re.sub(r"-\n(?=[a-z])", "", text)
+        if strip_line_numbers:
+            text = re.sub(r"(?m)\s+\d{1,4}\s*$", "", text)
         text = re.sub(r"\s*\n\s*", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
-    def _sort_page_blocks(self, blocks: list, page_rect: fitz.Rect) -> list:
+    def _sort_page_blocks(self, blocks: list, page_rect: fitz.Rect, manuscript_mode: bool = False) -> list:
+        if manuscript_mode:
+            return sorted(blocks, key=lambda b: (round(b[1], 1), round(b[0], 1)))
         midpoint = page_rect.width / 2
         top_full_width: list = []
         bottom_full_width: list = []
@@ -219,6 +237,8 @@ class PDFParser:
     def _looks_like_non_content(self, text: str) -> bool:
         if self._looks_like_caption(text):
             return False
+        if self._looks_like_accelerated_preview_noise(text):
+            return True
         if re.search(r"check for updates", text, re.I):
             return True
         if NON_CONTENT_RE.search(text):
@@ -230,6 +250,31 @@ class PDFParser:
         if not re.search(r"[A-Za-z\u4e00-\u9fff]", text) and len(text.strip()) < 40:
             return True
         if len(text) < 18 and re.search(r"\b(article|volume|issue|page|doi)\b", text, re.I):
+            return True
+        return False
+
+    def _looks_like_accelerated_preview_noise(self, text: str) -> bool:
+        compact = re.sub(r"\s+", "", text).upper()
+        if compact == "ACCELERATEDARTICLEPREVIEW":
+            return True
+        return bool(
+            re.search(
+                r"^(Accelerated Article Preview|This is a PDF file of a peer-reviewed paper|"
+                r"Nature is providing this early version|The text and figures will undergo|"
+                r"Please note that during the production process|All legal disclaimers)",
+                text,
+                re.I,
+            )
+        )
+
+    def _looks_like_preview_front_matter(self, text: str) -> bool:
+        if self._looks_like_accelerated_preview_noise(text):
+            return True
+        if re.search(r"\b(Received:|Accepted:|Published online|Cite this article as:|Corresponding author:|https?://doi\.org|Nature \| www\.nature\.com)\b", text, re.I):
+            return True
+        if self._looks_like_author_line(text):
+            return True
+        if re.search(r"\b(University|Laboratory|Centre|Center|Institute|Department|Golden,\s*CO|Toledo,\s*OH|Boulder,\s*CO|USA)\b", text):
             return True
         return False
 
@@ -245,7 +290,7 @@ class PDFParser:
             return True
         return False
 
-    def _extract_info(self, page_texts: list[str], paragraphs: list[Paragraph], metadata: dict | None = None) -> PaperInfo:
+    def _extract_info(self, page_texts: list[str], paragraphs: list[Paragraph], metadata: dict | None = None, preview_mode: bool = False) -> PaperInfo:
         first_page = page_texts[0] if page_texts else ""
         doi_match = DOI_RE.search(first_page)
         publication = self._extract_publication_info("\n".join(page_texts[:4]))
@@ -270,6 +315,10 @@ class PDFParser:
                 title = metadata_title
         abstract = ""
         abstract = self._extract_labeled_abstract(page_texts)
+        if preview_mode and self._looks_like_accelerated_preview_noise(abstract):
+            abstract = ""
+        if preview_mode and not abstract:
+            abstract = self._guess_abstract_from_preview_manuscript(paragraphs, title)
         if not abstract:
             abstract = self._guess_abstract_from_layout(paragraphs, title)
         authors = self._extract_authors(paragraphs, title)
@@ -348,7 +397,7 @@ class PDFParser:
         cleaned = re.sub(r"\s+", " ", text or "").strip(" ,;")
         if not cleaned:
             return []
-        cleaned = re.sub(r"\b(?:and|&)\b", ",", cleaned)
+        cleaned = re.sub(r"\s+(?:and|&)\s+", ", ", cleaned)
         cleaned = re.sub(r";", ",", cleaned)
         authors = [a.strip(" ,;") for a in cleaned.split(",") if a.strip(" ,;")]
         return [a for a in authors if 1 < len(a) < 80][:40]
@@ -358,6 +407,11 @@ class PDFParser:
         info = {"journal": "", "volume": "", "issue": "", "pages": "", "year": ""}
         if not normalized:
             return info
+
+        cite_nature = re.search(r"Cite this article as:.{0,260}?\b(Nature)\s+https?://doi\.org/\S+.*?\b((?:19|20)\d{2})\b", normalized, re.I)
+        if cite_nature:
+            info["journal"] = cite_nature.group(1)
+            info["year"] = cite_nature.group(2)
 
         ieee_match = re.search(
             r"\b(?P<journal>IEEE\s+[A-Z][A-Z0-9 &/\-]+?)\s*,?\s+VOL\.?\s*(?P<volume>\d+[A-Za-z]?)"
@@ -422,7 +476,7 @@ class PDFParser:
 
         if not info["journal"]:
             journal_match = re.search(
-                r"\b(Nature Communications|Nature Photonics|Nature Energy|Science|Joule|Advanced Materials|Energy & Environmental Science|"
+                r"\b(Nature Communications|Nature Photonics|Nature Energy|Nature|Science|Joule|Advanced Materials|Energy & Environmental Science|"
                 r"ACS Energy Letters|ACS Energy Lett\.|Nano Energy|Cell Reports Physical Science|Chemical Engineering Journal|Solar RRL|Nat Commun|"
                 r"Advanced Energy Materials|Advanced Functional Materials|Angewandte Chemie|Journal of Materials Chemistry A|"
                 r"Energy & Environmental Materials|Matter|Chem|Device|Science Advances|PNAS|Small|Small Methods|"
@@ -507,11 +561,14 @@ class PDFParser:
     def _looks_like_author_line(self, text: str) -> bool:
         if len(text) > 1200 or DOI_RE.search(text) or SECTION_HINT_RE.match(text):
             return False
+        if len(text) > 650 or (len(text) > 350 and "." in text):
+            return False
         if re.search(r"\b(Abstract|Introduction|Received:|Accepted:|Published|Cite this|Open Access|ARTICLE IN PRESS|ACCESS Metrics|Supporting Information)\b", text, re.I):
             return False
-        if "." in text and len(text) < 220:
+        author_punctuation = text.count(",") >= 2 or bool(re.search(r"\s&\s", text))
+        if "." in text and len(text) < 220 and not author_punctuation:
             return False
-        if not ("," in text or "&" in text):
+        if not author_punctuation and not ("," in text or "&" in text):
             return False
         if re.search(r"[A-Z][a-z]+", text):
             return True
@@ -527,6 +584,8 @@ class PDFParser:
             x0, y0, x1, y1 = para.bbox
             if text == title or para.kind == "non_content" or self._looks_like_author_line(text):
                 continue
+            if self._looks_like_accelerated_preview_noise(text):
+                continue
             if text[:1].islower() or self._split_embedded_heading(text):
                 continue
             if len(text) < 180 or y0 < 180 or y0 > 460:
@@ -538,6 +597,35 @@ class PDFParser:
             return ""
         candidates.sort(key=lambda p: (p.bbox[1], p.bbox[0]))
         return candidates[0].text_original
+
+    def _guess_abstract_from_preview_manuscript(self, paragraphs: list[Paragraph], title: str) -> str:
+        collected: list[str] = []
+        started = False
+        for para in paragraphs:
+            if para.source_page < 2 or para.source_page > 4:
+                continue
+            text = para.text_original
+            if not text or text == title or para.kind == "non_content":
+                continue
+            if self._looks_like_accelerated_preview_noise(text) or self._looks_like_author_line(text):
+                continue
+            if re.match(r"^\d+\s", text) or re.search(r"Corresponding author|@|University|Laboratory|Department|Center\b", text, re.I):
+                continue
+            if not started:
+                if re.search(r"\b(perovskite solar cells|photovoltaics)\b", text, re.I) and not re.search(r"\bor photovoltaics\b", text, re.I):
+                    started = True
+                else:
+                    continue
+            if started and collected and re.search(r"\bor photovoltaics\b", text, re.I) and len(" ".join(collected)) > 300:
+                break
+            collected.append(text)
+            combined = " ".join(collected)
+            if len(combined) > 300 and re.search(r"\bbest to date\b", combined, re.I):
+                break
+            if len(combined) > 900 and re.search(r"\.\s*$", combined):
+                break
+        abstract = re.sub(r"\s+", " ", " ".join(collected)).strip()
+        return abstract if len(abstract) > 250 else ""
 
     def _mark_abstract_paragraph(self, paragraphs: list[Paragraph], abstract: str) -> None:
         if not abstract:
@@ -632,7 +720,7 @@ class PDFParser:
                 return False
             elif current.bbox[1] > 180:
                 return False
-            elif len(current.text_original.strip()) < 50:
+            elif len(current.text_original.strip()) < 50 and not re.match(r"^[a-z0-9),;/%±~<>≥≤]", current.text_original.lstrip()):
                 return False
         if self._starts_known_subheading(current.text_original):
             return False
@@ -640,13 +728,19 @@ class PDFParser:
         cur = current.text_original.lstrip()
         if re.search(r"[.!?。！？:]$", prev):
             return False
-        if re.match(r"^[a-z0-9),;/%±~<>≥≤]", cur):
+        if re.search(r"\b(on|of|for|with|and|or|the|a|an|to|in|by|at|from|under|over)$", prev, re.I):
+            return True
+        if re.match(r"^[A-Z]{2,}\b", cur):
+            return True
+        if re.match(r"^[a-z0-9(),;/%±~<>≥≤]", cur):
             return True
         if re.search(r"[,;]$", prev):
             return True
         return False
 
     def _starts_known_subheading(self, text: str) -> bool:
+        if not text or text[0].islower():
+            return False
         return bool(
             re.match(
                 r"^(Barrier energy quantification|Scattering barrier preparation|Drift barrier preparation|"
@@ -656,7 +750,6 @@ class PDFParser:
                 r"Fitting of Fick|Characterization|Device fabrication|Sample preparation|Materials characterization|"
                 r"Solar cell fabrication|Device characterization|Experimental details|Synthesis)\b",
                 text,
-                re.I,
             )
         )
 

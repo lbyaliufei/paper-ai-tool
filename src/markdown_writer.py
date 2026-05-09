@@ -200,12 +200,12 @@ code {{ background: #f5f5f5; padding: 1px 4px; }}
         lines += [f"*{caption}*", ""]
 
     def _find_caption_figure(self, caption: str, figures: list[Figure]) -> Figure | None:
-        m = re.match(r"^(Fig\.\s*\d+|Figure\s*\d+|Table\s*\d+|图\s*\d+)", caption, re.I)
+        m = re.match(r"^(Extended\s+Data\s+Fig\.?\s*\d+|Fig\.?\s*\d+|Figure\s*\d+|Table\s*\d+|图\s*\d+)", caption, re.I)
         if not m:
             return None
-        key = re.sub(r"^Figure", "Fig.", m.group(1), flags=re.I).lower().replace(" ", "")
+        key = self._fig_ref_key(m.group(1))
         for fig in figures:
-            if fig.figure_id.lower().replace(" ", "") == key:
+            if self._fig_ref_key(fig.figure_id) == key:
                 return fig
         return None
 
@@ -236,13 +236,14 @@ code {{ background: #f5f5f5; padding: 1px 4px; }}
         refs: list[str] = []
         seen: set[str] = set()
         patterns = [
-            r"(?<!Supplementary\s)(?<!Supplementary\sFig\.\s)(?<!Supplementary\sFigure\s)\bFig\.\s*(\d+)(?:\s*[A-Za-z]|\s*[a-z](?:[,–-]\s*[a-z])*)?",
+            r"(?<!Supplementary\s)(?<!Supplementary\sFig\.\s)(?<!Supplementary\sFigure\s)\bExtended\s+Data\s+Fig\.?\s*(\d+)(?:\s*[A-Za-z]|\s*[a-z](?:[,–-]\s*[a-z])*)?",
+            r"(?<!Supplementary\s)(?<!Supplementary\sFig\.\s)(?<!Supplementary\sFigure\s)(?<!Extended\sData\s)\bFig\.?\s*(\d+)(?:\s*[A-Za-z]|\s*[a-z](?:[,–-]\s*[a-z])*)?",
             r"(?<!Supplementary\s)\bFigure\s*(\d+)(?:\s*[A-Za-z]|\s*[a-z](?:[,–-]\s*[a-z])*)?",
             r"(?<!补充)\b图\s*(\d+)(?:\s*[A-Za-z]|\s*[a-z](?:[,–-]\s*[a-z])*)?",
         ]
-        for pattern in patterns:
+        for index, pattern in enumerate(patterns):
             for match in re.finditer(pattern, text, flags=re.I):
-                ref = f"fig.{match.group(1)}"
+                ref = f"extendeddatafig.{match.group(1)}" if index == 0 else f"fig.{match.group(1)}"
                 if ref not in seen:
                     refs.append(ref)
                     seen.add(ref)
@@ -250,7 +251,11 @@ code {{ background: #f5f5f5; padding: 1px 4px; }}
 
     def _fig_ref_key(self, figure_id: str) -> str:
         match = re.search(r"(\d+)", figure_id)
-        return f"fig.{match.group(1)}" if match else figure_id.lower().replace(" ", "")
+        if not match:
+            return figure_id.lower().replace(" ", "")
+        if re.search(r"Extended\s+Data", figure_id, re.I):
+            return f"extendeddatafig.{match.group(1)}"
+        return f"fig.{match.group(1)}"
 
     def _fig_key(self, fig: Figure) -> str:
         return f"{fig.figure_id.lower()}@{fig.page}"
