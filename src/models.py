@@ -11,6 +11,9 @@ class Paragraph:
     text_zh: str = ""
     bbox: list[float] | None = None
     kind: str = "paragraph"
+    font_size: float | None = None
+    is_bold: bool = False
+    heading_level: int = 0
 
 
 @dataclass
@@ -18,6 +21,7 @@ class Section:
     section_title: str
     section_title_zh: str = ""
     paragraphs: list[Paragraph] = field(default_factory=list)
+    heading_level: int = 1
 
 
 @dataclass
@@ -46,6 +50,7 @@ class Figure:
     image_base64: str = ""
     caption_bbox: list[float] = field(default_factory=list)
     warning: str = ""
+    image_source: str = "heuristic"
 
 
 @dataclass

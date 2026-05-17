@@ -43,8 +43,14 @@ class FigureExtractor:
                 caption = " ".join(b["text"] for b in caption_blocks)
                 if self._caption_kind(fig_id) == "table":
                     bbox = self._infer_table_bbox(page, block, blocks)
+                    source = "heuristic"
                 else:
-                    bbox = self._infer_figure_bbox(page, block, blocks)
+                    content_bbox, source = self._find_figure_from_content(page, block["bbox"])
+                    if content_bbox is not None:
+                        bbox = content_bbox
+                    else:
+                        bbox = self._infer_figure_bbox(page, block, blocks)
+                        source = "heuristic"
                 target_page = page
                 target_page_num = page_num
                 if self._should_try_next_page(page, block) and page_num < len(doc):
@@ -72,6 +78,7 @@ class FigureExtractor:
                         image_base64=base64_data,
                         caption_bbox=[round(v, 2) for v in self._union_bbox([b["bbox"] for b in caption_blocks])],
                         warning=warning,
+                        image_source=source,
                     )
                 )
         except Exception as exc:
@@ -286,6 +293,99 @@ class FigureExtractor:
         except Exception as exc:
             self.logger.exception("Could not crop figure: %s", exc)
             return b"", "image/png", str(exc)
+
+    def _find_embedded_images(self, page: fitz.Page, min_size: float = 120.0) -> list[dict]:
+        images: list[dict] = []
+        try:
+            for img_info in page.get_images(full=True):
+                try:
+                    bbox = page.get_image_bbox(img_info)
+                except Exception:
+                    continue
+                w, h = bbox.width, bbox.height
+                if bbox.is_empty or w < min_size or h < min_size:
+                    continue
+                images.append({
+                    "bbox": [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
+                    "width": img_info[2],
+                    "height": img_info[3],
+                    "xref": img_info[0],
+                })
+        except Exception:
+            pass
+        return images
+
+    def _find_drawings(self, page: fitz.Page, min_size: float = 80.0) -> list[list[float]]:
+        page_rect = page.rect
+        page_w, page_h = page_rect.width, page_rect.height
+        drawings = page.get_drawings()
+        bboxes: list[list[float]] = []
+        for drawing in drawings:
+            rect = drawing.get("rect")
+            if rect is None:
+                continue
+            clip_x0 = max(0.0, rect.x0)
+            clip_y0 = max(0.0, rect.y0)
+            clip_x1 = min(page_w, rect.x1)
+            clip_y1 = min(page_h, rect.y1)
+            w = clip_x1 - clip_x0
+            h = clip_y1 - clip_y0
+            if w > min_size and h > min_size and w < page_w * 0.95 and h < page_h * 0.9:
+                bboxes.append([clip_x0, clip_y0, clip_x1, clip_y1])
+        if len(bboxes) <= 1:
+            return bboxes
+        merged: list[list[float]] = []
+        sorted_boxes = sorted(bboxes, key=lambda b: (b[1], b[0]))
+        current = list(sorted_boxes[0])
+        for bbox in sorted_boxes[1:]:
+            if bbox[1] <= current[3] + 30 and abs(bbox[0] - current[0]) < 80:
+                current[2] = max(current[2], bbox[2])
+                current[3] = max(current[3], bbox[3])
+            else:
+                merged.append(current)
+                current = list(bbox)
+        merged.append(current)
+        return merged
+
+    def _find_figure_from_content(self, page: fitz.Page, caption_bbox: list[float]) -> tuple[list[float] | None, str]:
+        cap_y0 = caption_bbox[1]
+        page_height = page.rect.height
+        page_width = page.rect.width
+        page_area = page_width * page_height
+        min_figure_area = page_area * 0.015
+        candidates: list[tuple[list[float], float, str]] = []
+        images = self._find_embedded_images(page, min_size=150.0)
+        for img in images:
+            img_bbox = img["bbox"]
+            if img_bbox[3] < cap_y0 + 10 and img_bbox[1] > page_height * 0.03:
+                area = (img_bbox[2] - img_bbox[0]) * (img_bbox[3] - img_bbox[1])
+                if area > min_figure_area:
+                    candidates.append((img_bbox, area, "embedded"))
+        drawings = self._find_drawings(page, min_size=150.0)
+        for d_bbox in drawings:
+            if d_bbox[3] < cap_y0 + 10 and d_bbox[1] > page_height * 0.03:
+                area = (d_bbox[2] - d_bbox[0]) * (d_bbox[3] - d_bbox[1])
+                if area > min_figure_area:
+                    candidates.append((d_bbox, area, "drawing"))
+        if not candidates:
+            if images:
+                candidates = [(img["bbox"], (img["bbox"][2] - img["bbox"][0]) * (img["bbox"][3] - img["bbox"][1]), "embedded") for img in images if img["bbox"][3] < cap_y0 + 10]
+            if not candidates and drawings:
+                candidates = [(d, (d[2] - d[0]) * (d[3] - d[1]), "drawing") for d in drawings if d[3] < cap_y0 + 10]
+        if not candidates:
+            return (None, "heuristic")
+        candidates.sort(key=lambda c: c[1], reverse=True)
+        best_bbox, _area, source = candidates[0]
+        padded = self._pad_bbox(best_bbox, page.rect)
+        return (padded, source)
+
+    def _pad_bbox(self, bbox: list[float], page_rect: fitz.Rect, pad: float = 8.0) -> list[float]:
+        return [
+            max(0, bbox[0] - pad),
+            max(0, bbox[1] - pad),
+            min(page_rect.width, bbox[2] + pad),
+            min(page_rect.height, bbox[3] + pad),
+        ]
 
     def _dedupe(self, figures: list[Figure]) -> list[Figure]:
         by_id: dict[str, Figure] = {}

@@ -45,7 +45,9 @@ class MarkdownWriter:
         for section in paper.sections:
             heading = section.section_title_zh or section.section_title
             if heading:
-                lines += [f"## {heading}", ""]
+                level = min(section.heading_level + 1, 5)
+                prefix = "#" * level
+                lines += [f"{prefix} {heading}", ""]
             for para in section.paragraphs:
                 if para.kind == "non_content":
                     continue
@@ -146,7 +148,9 @@ code {{ background: #f5f5f5; padding: 1px 4px; }}
                 if row.get("ff_percent") is not None:
                     metrics.append(f"FF={row.get('ff_percent')}%")
                 source = self._clean_summary_text(row.get("source_text", ""))
-                lines.append(f"- {'，'.join(metrics) or '检测到性能描述'}；角色：{row.get('sample_role') or 'unknown'}；来源：{source[:180]}{self._page_suffix(row)}")
+                role_map = {"target": "目标器件", "control": "对照器件", "reference": "参考文献", "unknown": "未知"}
+                role = role_map.get(row.get("sample_role", "unknown"), row.get("sample_role", "unknown"))
+                lines.append(f"- {'，'.join(metrics) or '检测到性能描述'}；角色：{role}；来源：{source[:180]}{self._page_suffix(row)}")
         else:
             lines.append("- 未自动识别到明确器件性能数据。")
 
@@ -163,7 +167,9 @@ code {{ background: #f5f5f5; padding: 1px 4px; }}
                 if row.get("retained_pce_percent") is not None:
                     retained = f"，保持率={row.get('retained_pce_operator', '')}{row.get('retained_pce_percent')}%"
                 source = self._clean_summary_text(row.get("source_text", ""))
-                lines.append(f"- {row.get('test_type') or 'stability'}，{duration}{retained}；{row.get('qualitative_result') or ''}；来源：{source[:180]}{self._page_suffix(row)}")
+                test_type_map = {"MPP": "最大功率点跟踪", "thermal": "热稳定性", "damp_heat": "湿热", "reverse_bias": "反向偏压", "illumination": "光照", "other": "其他"}
+                test_type = test_type_map.get(row.get("test_type", ""), row.get("test_type", "稳定性"))
+                lines.append(f"- {test_type}，{duration}{retained}；{row.get('qualitative_result') or ''}；来源：{source[:180]}{self._page_suffix(row)}")
         else:
             lines.append("- 未自动识别到明确稳定性测试数据。")
 
