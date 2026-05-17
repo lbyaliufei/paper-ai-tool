@@ -23,7 +23,7 @@ SECTION_HINT_RE = re.compile(
     re.I,
 )
 DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+\b", re.I)
-YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+YEAR_RE = re.compile(r"\b((?:19|20)\d{2})\b")
 NON_CONTENT_RE = re.compile(
     r"("
     r"©|copyright|all rights reserved|"
@@ -32,15 +32,17 @@ NON_CONTENT_RE = re.compile(
     r"publisher'?s note|"
     r"state key laboratory|e-mail:|these authors contributed equally|"
     r"www\.|https?://|"
-    r"nature communications|nature energy|science|cell reports|joule|advanced materials|"
+    r"nature communications|nature energy|science direct|sciencedirect|elsevier|article in press|available online|"
     r"supplementary information|supporting information|associated content|"
-    r"science direct|sciencedirect|elsevier|article in press|available online|"
     r"highlights|graphical abstract|keywords|index terms|nomenclature|"
     r"open access|access metrics|article recommendations|"
     r"reporting summary|"
     r"author contributions|competing interests|conflict of interest|conflicts of interest|"
     r"data availability|code availability|"
-    r"references\b|bibliography\b|notes and references\b"
+    r"references\b|bibliography\b|notes and references\b|"
+    r"editor'?s summary|view the article online|"
+    r"is published by|registered trademark|"
+    r"use of this article is subject to the terms"
     r")",
     re.I,
 )
@@ -54,43 +56,79 @@ class PDFParser:
         doc = fitz.open(pdf_path)
         metadata = dict(doc.metadata or {})
         preview_mode = self._is_accelerated_preview(doc)
+        body_font_size = self._estimate_body_font_size(doc)
         raw_blocks: list[dict] = []
         paragraphs: list[Paragraph] = []
         page_texts: list[str] = []
         try:
             for page_index, page in enumerate(doc, start=1):
-                blocks = page.get_text("blocks")
-                blocks = self._sort_page_blocks(blocks, page.rect, preview_mode)
+                dict_blocks, image_regions = self._extract_page_dict_blocks(page)
+                sorted_blocks = self._sort_page_blocks(dict_blocks, page.rect, preview_mode)
                 page_parts: list[str] = []
-                for block in blocks:
-                    x0, y0, x1, y1, text, *_ = block
+                for block in sorted_blocks:
+                    x0, y0, x1, y1, text, block_type, block_no, font_meta = block
+                    if block_type == 1 or not text.strip():
+                        continue
                     clean = self._clean_text(text, strip_line_numbers=preview_mode and page_index > 1)
                     if not clean:
                         continue
+                    font_size = font_meta.get("font_size")
+                    is_bold = font_meta.get("is_bold", False)
                     if self._is_repeated_margin_block(clean, [x0, y0, x1, y1], page.rect):
                         kind = "non_content"
                     else:
                         kind = "caption" if self._looks_like_caption(clean) else ("heading" if self._looks_like_heading(clean) else "paragraph")
+                    if kind != "non_content" and self._looks_like_watermark(clean, [x0, y0, x1, y1], page.rect, font_size):
+                        kind = "non_content"
                     if preview_mode and page_index <= 2 and self._looks_like_preview_front_matter(clean):
                         kind = "non_content"
-                    item = {"page": page_index, "bbox": [x0, y0, x1, y1], "text": clean, "page_rect": list(page.rect)}
+                    heading_level = 0
+                    if kind == "heading":
+                        heading_level = self._detect_heading_level(clean, font_size, is_bold, body_font_size)
+                    # Detect bold-leading subheadings: if a bold paragraph wasn't classified
+                    # as a heading, check if it starts with a subheading-like phrase.
+                    if kind == "paragraph" and is_bold and body_font_size and font_size and font_size >= body_font_size * 0.9:
+                        inline_title, inline_rest = self._split_inline_heading(clean)
+                        if inline_rest and len(inline_title) > 10:
+                            kind = "heading"
+                            heading_level = self._detect_heading_level(inline_title, font_size, is_bold, body_font_size) or 1
+                    item = {"page": page_index, "bbox": [x0, y0, x1, y1], "text": clean, "page_rect": list(page.rect), "font_size": font_size, "is_bold": is_bold}
                     raw_blocks.append(item)
                     page_parts.append(clean)
                     if kind != "caption" and self._looks_like_non_content(clean):
                         kind = "non_content"
+                    # Short text without sentence structure: likely diagram/axis labels
+                    if kind == "paragraph" and len(clean) < 55 and not re.search(r"[.!?]", clean) and not re.search(r"\b(the|and|or|for|with|this|that|are|was|were|have|has|from|been|can|may|also|not|its|their|our|using|based|shown|found|between|within)\b", clean, re.I):
+                        kind = "non_content"
                     if page_index == 1 and y0 < page.rect.height * 0.35 and self._looks_like_author_line(clean):
                         kind = "non_content"
-                    paragraphs.append(Paragraph(source_page=page_index, text_original=clean, bbox=[x0, y0, x1, y1], kind=kind))
+                    paragraphs.append(Paragraph(source_page=page_index, text_original=clean, bbox=[x0, y0, x1, y1], kind=kind, font_size=font_size, is_bold=is_bold, heading_level=heading_level))
                 raw_text = self._clean_text(page.get_text("text"), strip_line_numbers=preview_mode and page_index > 1)
                 page_texts.append(raw_text or "\n".join(page_parts))
         finally:
             doc.close()
 
+        repeated_texts = self._find_repeated_elements(raw_blocks)
+        if repeated_texts:
+            for para in paragraphs:
+                key = re.sub(r"\s+", " ", para.text_original.lower()).strip()
+                if key in repeated_texts:
+                    para.kind = "non_content"
+        # Filter out tiny-font text (figure axis labels, data callouts, etc.)
+        if body_font_size:
+            for para in paragraphs:
+                if para.kind in {"non_content", "caption"}:
+                    continue
+                fs = para.font_size
+                if fs and fs < body_font_size * 0.62 and len(para.text_original) < 90:
+                    para.kind = "non_content"
         full_text = "\n\n".join(page_texts)
         paper_info = self._extract_info(page_texts, paragraphs, metadata, preview_mode)
-        if preview_mode and paper_info.title:
+        if paper_info.title:
+            clean_title = re.sub(r"\s+", " ", paper_info.title).strip()
             for para in paragraphs:
-                if para.source_page <= 2 and para.text_original == paper_info.title:
+                para_clean = re.sub(r"\s+", " ", para.text_original).strip()
+                if para.source_page <= 2 and (para_clean == clean_title or clean_title in para_clean or para_clean.startswith(clean_title)):
                     para.kind = "non_content"
         self._mark_abstract_paragraph(paragraphs, paper_info.abstract)
         sections = self._build_sections(paragraphs)
@@ -103,9 +141,177 @@ class PDFParser:
         sample = "\n".join(doc[i].get_text("text") for i in range(min(5, len(doc))))
         return bool(re.search(r"ACCELERATED\s+ARTICLE\s+PREVIEW|Accelerated Article Preview", sample, re.I))
 
+    def _estimate_body_font_size(self, doc: fitz.Document, sample_pages: int = 5) -> float | None:
+        sizes: list[float] = []
+        for page_idx in range(min(len(doc), sample_pages)):
+            page_dict = doc[page_idx].get_text("dict")
+            for block in page_dict.get("blocks", []):
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = span.get("text", "").strip()
+                        if len(text) > 30:
+                            sizes.append(span.get("size", 0))
+        if not sizes:
+            return None
+        return sorted(sizes)[len(sizes) // 2]
+
+    def _extract_page_dict_blocks(self, page: fitz.Page) -> tuple[list[tuple], list[list[float]]]:
+        page_dict = page.get_text("dict")
+        blocks: list[tuple] = []
+        image_regions: list[list[float]] = []
+        for i, dblock in enumerate(page_dict.get("blocks", [])):
+            bbox = dblock.get("bbox", [0, 0, 0, 0])
+            x0, y0, x1, y1 = bbox
+            block_type = dblock.get("type", 0)
+            if block_type == 1:
+                image_regions.append(bbox)
+                blocks.append((x0, y0, x1, y1, "", 1, i, {"font_size": None, "is_bold": False}))
+                continue
+            parts: list[str] = []
+            sizes: list[float] = []
+            weights: list[int] = []
+            any_bold = False
+            lines = dblock.get("lines", [])
+            for li, line in enumerate(lines):
+                if li > 0:
+                    parts.append("\n")
+                for span in line.get("spans", []):
+                    stext = span.get("text", "")
+                    if stext:
+                        parts.append(stext)
+                        sz = span.get("size", 0)
+                        if sz > 0.5:
+                            sizes.append(sz)
+                            weights.append(len(stext))
+                        fn = span.get("font", "") or ""
+                        if "Bold" in fn or (span.get("flags", 0) & 16):
+                            any_bold = True
+            text = "".join(parts)
+            if sizes and weights:
+                total_w = sum(weights)
+                avg_size = sum(s * w for s, w in zip(sizes, weights)) / total_w
+                font_size = round(avg_size, 1)
+            else:
+                font_size = None
+            font_meta = {"font_size": font_size, "is_bold": any_bold}
+            blocks.append((x0, y0, x1, y1, text, block_type, i, font_meta))
+        return blocks, image_regions
+
+    def _find_repeated_elements(self, raw_blocks: list[dict], min_repeat_pages: int = 3) -> set[str]:
+        from collections import defaultdict
+        groups: dict[str, list[tuple[int, float, int, str]]] = defaultdict(list)
+        for i, block in enumerate(raw_blocks):
+            text = block["text"].strip()
+            if not text:
+                continue
+            original = text
+            key = re.sub(r"\s+", " ", text.lower()).strip()
+            if re.fullmatch(r"\d+", key):
+                y_center = (block["bbox"][1] + block["bbox"][3]) / 2
+                ph = block["page_rect"][3]
+                if y_center > ph * 0.85 and len(text) < 5:
+                    groups["__PAGE_NUM__"].append((i, y_center, block["page"], original))
+                continue
+            y_center = (block["bbox"][1] + block["bbox"][3]) / 2
+            groups[key].append((i, y_center, block["page"], original))
+        repeated: set[str] = set()
+        page_num_pages = {p for _, _, p, _ in groups.get("__PAGE_NUM__", [])}
+        if len(page_num_pages) >= min_repeat_pages:
+            repeated.add("__PAGE_NUM__")
+        for key, occs in groups.items():
+            if key == "__PAGE_NUM__":
+                continue
+            unique_pages = {p for _, _, p, _ in occs}
+            if len(unique_pages) >= min_repeat_pages:
+                y_vals = [y for _, y, _, _ in occs]
+                if max(y_vals) - min(y_vals) < 30:
+                    repeated.add(key)
+        # Fuzzy matching for dynamic headers/footers (e.g., "Science 14 May 2026 724")
+        by_page: dict[int, list[tuple[int, str, float]]] = defaultdict(list)
+        for i, block in enumerate(raw_blocks):
+            text = block["text"].strip()
+            if not text:
+                continue
+            raw_key = re.sub(r"\s+", " ", text).strip()
+            if raw_key and len(raw_key) > 5:
+                y_center = (block["bbox"][1] + block["bbox"][3]) / 2
+                by_page[block["page"]].append((i, raw_key, y_center))
+        if len(by_page) >= min_repeat_pages:
+            # Build a normalized fingerprint: strip digits from end, strip leading digits
+            def fuzzy_key(text: str) -> str:
+                t = re.sub(r"\s*\d+\s*$", "", text.strip())
+                t = re.sub(r"^\d+\s*", "", t)
+                return re.sub(r"\s+", " ", t).strip().lower()
+            fuzzy_groups: dict[str, list[int]] = defaultdict(list)
+            for page, items in by_page.items():
+                seen_on_page: set[str] = set()
+                for _, text, y_center in items:
+                    ph = raw_blocks[0]["page_rect"][3] if raw_blocks else 800
+                    if y_center < ph * 0.12 or y_center > ph * 0.88:
+                        fk = fuzzy_key(text)
+                        if len(fk) > 3 and fk not in seen_on_page:
+                            seen_on_page.add(fk)
+                            fuzzy_groups[fk].append(page)
+            for fk, pages in fuzzy_groups.items():
+                if len(set(pages)) >= min_repeat_pages:
+                    for block in raw_blocks:
+                        text = block["text"].strip()
+                        y_center = (block["bbox"][1] + block["bbox"][3]) / 2
+                        ph = block["page_rect"][3]
+                        if (y_center < ph * 0.12 or y_center > ph * 0.88) and fuzzy_key(text) == fk:
+                            repeated.add(re.sub(r"\s+", " ", text.lower()).strip())
+        return repeated
+
+    def _looks_like_watermark(self, text: str, bbox: list[float], page_rect: fitz.Rect, font_size: float | None = None) -> bool:
+        watermark_keywords = {
+            "preprint", "draft", "confidential", "author manuscript",
+            "review copy", "review version", "not for distribution",
+            "submitted manuscript", "under review", "embargoed",
+            "accepted manuscript", "uncorrected proof",
+        }
+        text_lower = text.lower()
+        if any(w in text_lower for w in watermark_keywords):
+            return True
+        x0, y0, x1, y1 = bbox
+        pw, ph = page_rect.width, page_rect.height
+        block_w = x1 - x0
+        is_wide = block_w > pw * 0.5
+        is_centered_h = abs((x0 + x1) / 2 - pw / 2) < pw * 0.15
+        is_v_centered = abs((y0 + y1) / 2 - ph / 2) < ph * 0.35
+        is_large = font_size is not None and font_size > 20
+        is_short = len(text.strip()) < 60
+        if is_wide and is_centered_h and is_v_centered and is_large and is_short:
+            return True
+        return False
+
+    def _detect_heading_level(self, text: str, font_size: float | None, is_bold: bool, body_font_size: float | None) -> int:
+        if self._looks_like_caption(text):
+            return 0
+        num_match = re.match(r"^(\d+(?:\.\d+)*)\s+", text)
+        if num_match:
+            segments = num_match.group(1).split(".")
+            return min(len(segments), 3)
+        roman_match = re.match(r"^([IVXLCDM]+)\.\s+", text)
+        if roman_match:
+            return 1
+        if SECTION_HINT_RE.match(text):
+            return 1
+        if font_size and body_font_size and body_font_size > 0:
+            ratio = font_size / body_font_size
+            if ratio > 1.3:
+                return 1
+            if ratio > 1.1:
+                return 2
+        if is_bold and not self._looks_like_non_content(text):
+            return 1
+        return 0
+
     def _clean_text(self, text: str, strip_line_numbers: bool = False) -> str:
         text = text.replace("\x00", " ")
         text = text.replace("\x01", "-")
+        text = text.replace("\xad", "")  # soft hyphen
         text = text.translate(str.maketrans({"ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl"}))
         text = text.replace("ð", "(").replace("Þ", ")")
         text = re.sub(r"ffiffi(?:ffi)*\s*([A-Za-z0-9]+)\s*p", r"sqrt(\1)", text)
@@ -237,11 +443,24 @@ class PDFParser:
     def _looks_like_non_content(self, text: str) -> bool:
         if self._looks_like_caption(text):
             return False
+        if self._looks_like_heading(text):
+            return False
         if self._looks_like_accelerated_preview_noise(text):
             return True
         if re.search(r"check for updates", text, re.I):
             return True
         if NON_CONTENT_RE.search(text):
+            return True
+        # Science/American journal running header/footer patterns
+        if re.fullmatch(r"Research\s+Article\s*S?", text.strip(), re.I):
+            return True
+        if re.fullmatch(r"^(?:SCIENCE|Science)\s+\d{1,2}\s+[A-Z][a-z]+\s+\d{4}\s*\d*$", text.strip()):
+            return True
+        # Short all-caps running section headers (e.g., "SOLAR CELLS")
+        if re.fullmatch(r"[A-Z][A-Z\s]{4,40}", text.strip()) and len(text.strip()) < 45:
+            return True
+        # ISSN / publisher boilerplate
+        if re.search(r"\bISSN\s+\d{4}[-−]\d{4}\b", text):
             return True
         if DOI_RE.search(text) and len(text) < 220:
             return True
@@ -293,8 +512,15 @@ class PDFParser:
     def _extract_info(self, page_texts: list[str], paragraphs: list[Paragraph], metadata: dict | None = None, preview_mode: bool = False) -> PaperInfo:
         first_page = page_texts[0] if page_texts else ""
         doi_match = DOI_RE.search(first_page)
-        publication = self._extract_publication_info("\n".join(page_texts[:4]))
-        metadata_title = self._clean_title_candidate((metadata or {}).get("title", "") or "")
+        doi_str = doi_match.group(0) if doi_match else ""
+        if not doi_str:
+            all_text = "\n".join(page_texts)
+            all_dois: list[str] = [m.group(0) for m in DOI_RE.finditer(all_text)]
+            non_repo = [d for d in all_dois if not re.search(r"zenodo|figshare|osf\.io|researchgate|academia\.edu", d, re.I)]
+            doi_str = (non_repo or all_dois or [""])[-1]
+        metadata_dict = metadata or {}
+        publication = self._extract_publication_info("\n".join(page_texts[:4]), metadata_dict)
+        metadata_title = self._clean_title_candidate(metadata_dict.get("title", "") or "")
         title = ""
         for p in paragraphs[:12]:
             t = p.text_original
@@ -328,7 +554,7 @@ class PDFParser:
         return PaperInfo(
             title=title,
             authors=authors,
-            doi=doi_match.group(0) if doi_match else "",
+            doi=doi_str,
             journal=publication.get("journal", ""),
             volume=publication.get("volume", ""),
             issue=publication.get("issue", ""),
@@ -341,6 +567,7 @@ class PDFParser:
         text = re.sub(r"\s+", " ", text).strip(" .;:-")
         text = re.sub(r"^(Article|Research Article|Original Article|Review Article|Communication|Letter|ARTICLE IN PRESS|Open Access)\b[:.\s-]*", "", text, flags=re.I).strip()
         text = re.sub(r"^Nature Communications Article in Press\b[:.\s-]*", "", text, flags=re.I).strip()
+        text = re.sub(r"^(?:SCIENCE|SOLAR CELLS|PEROVSKITE PHOTOVOLTAICS|PHOTOVOLTAICS|RESEARCH\s*ARTICLE\s*S?)\s*(?=[A-Z])", "", text).strip()
         return text
 
     def _looks_like_title_noise(self, text: str) -> bool:
@@ -402,11 +629,25 @@ class PDFParser:
         authors = [a.strip(" ,;") for a in cleaned.split(",") if a.strip(" ,;")]
         return [a for a in authors if 1 < len(a) < 80][:40]
 
-    def _extract_publication_info(self, text: str) -> dict[str, str]:
+    def _extract_publication_info(self, text: str, metadata: dict | None = None) -> dict[str, str]:
         normalized = re.sub(r"\s+", " ", text).strip()
         info = {"journal": "", "volume": "", "issue": "", "pages": "", "year": ""}
         if not normalized:
-            return info
+            normalized = ""
+        metadata = metadata or {}
+
+        # Parse metadata subject field (e.g., "Science 2026.392:724-728")
+        subject = metadata.get("subject", "") or ""
+        subject_match = re.match(r"([A-Z][A-Za-z &]+)\s+((?:19|20)\d{2})\.(\d+[A-Za-z]?):(\d+(?:[-–]\d+)?)", subject)
+        if subject_match:
+            if not info["journal"]:
+                info["journal"] = self._clean_journal_name(subject_match.group(1))
+            if not info["year"]:
+                info["year"] = subject_match.group(2)
+            if not info["volume"]:
+                info["volume"] = subject_match.group(3)
+            if not info["pages"]:
+                info["pages"] = subject_match.group(4).replace("−", "-").replace("–", "-")
 
         cite_nature = re.search(r"Cite this article as:.{0,260}?\b(Nature)\s+https?://doi\.org/\S+.*?\b((?:19|20)\d{2})\b", normalized, re.I)
         if cite_nature:
@@ -439,6 +680,13 @@ class PDFParser:
             r"(?P<journal>Adv(?:anced)?\.?\s+[A-Za-z &]+|Angew(?:andte)?\.?\s+[A-Za-z &]+|Small|Solar RRL)"
             r"\s*,?\s*(?P<year>(?:19|20)\d{2})\s*,\s*(?P<volume>\d{1,4}[A-Za-z]?)"
             r"\s*,\s*(?P<pages>[A-Za-z]?\d+(?:[-−–]\d+)?)",
+            # IEEE style: IEEE J. Photovoltaics, vol. 12, no. 3, pp. 678-685, May 2022
+            r"(?P<journal>IEEE\s+[A-Z][A-Za-z. &/]+?),\s*vol\.?\s*(?P<volume>\d+[A-Za-z]?)"
+            r"(?:,\s*no\.?\s*(?P<issue>\d+[A-Za-z]?))?(?:,\s*(?:pp?\.?\s*)?(?P<pages>[A-Za-z]?\d+(?:[-–]\d+)?))?"
+            r",?\s*(?:[A-Z][a-z]{2,8}\.?)?\s*(?P<year>(?:19|20)\d{2})",
+            # APS style: Phys. Rev. B 103, 125203 (2021)
+            r"(?P<journal>Phys(?:ical)?\.?\s*Rev(?:iew)?\.?\s*[A-Za-z &]+?)\s+"
+            r"(?P<volume>\d+[A-Za-z]?)\s*,\s*(?P<pages>[A-Za-z]?\d+)\s*\((?P<year>(?:19|20)\d{2})\)",
         ]
         for pattern in citation_patterns:
             if info["journal"] and info["year"]:
@@ -480,7 +728,8 @@ class PDFParser:
                 r"ACS Energy Letters|ACS Energy Lett\.|Nano Energy|Cell Reports Physical Science|Chemical Engineering Journal|Solar RRL|Nat Commun|"
                 r"Advanced Energy Materials|Advanced Functional Materials|Angewandte Chemie|Journal of Materials Chemistry A|"
                 r"Energy & Environmental Materials|Matter|Chem|Device|Science Advances|PNAS|Small|Small Methods|"
-                r"IEEE [A-Z][A-Z0-9 &/\-]+|Applied Physics Letters|Physical Review [A-Z])\b",
+                r"IEEE [A-Z][A-Z0-9 &/\-]+|Applied Physics Letters|Physical Review [A-Za-z]+|Phys\. Rev\. [A-Za-z]+|"
+                r"Physical Review Letters|PRX Energy|PRX Quantum)\b",
                 normalized,
                 re.I,
             )
@@ -499,6 +748,20 @@ class PDFParser:
             info["journal"] = "Nature Communications"
             info["year"] = nat_match.group(1)
 
+        # APS style: Phys. Rev. B 103, 125203 (2021) or Phys. Rev. Lett. 126, 037401 (2021)
+        if not info["journal"] or not info["volume"]:
+            aps_match = re.search(
+                r"\b(?P<journal>Phys(?:ical)?\.?\s*Rev(?:iew)?\.?\s*[A-Za-z]+|[A-Z][a-z]+\.?\s*Rev\.?\s*[A-Za-z]+)\s+"
+                r"(?P<volume>\d+[A-Za-z]?)\s*,\s*(?P<pages>[A-Za-z]?\d+)\s*\((?P<year>(?:19|20)\d{2})\)",
+                normalized, re.I,
+            )
+            if aps_match:
+                for key in info:
+                    value = aps_match.groupdict().get(key) or ""
+                    if value and not info[key] and key != "issue":
+                        info[key] = value.strip(" .,:;|").replace("−", "-").replace("–", "-")
+                info["journal"] = self._clean_journal_name(info["journal"])
+
         if not info["volume"]:
             volume_match = re.search(r"\b(?:vol(?:ume)?\.?\s*)?(\d+[A-Za-z]?)\s*\(([^)]+)\)\s*[:;,]\s*([A-Za-z]?\d+(?:[-−–]\d+)?)", normalized, re.I)
             if volume_match:
@@ -511,13 +774,13 @@ class PDFParser:
             if volume_match:
                 info["volume"] = volume_match.group(1)
         if not info["issue"]:
-            issue_match = re.search(r"\bissue\s+([A-Za-z0-9.-]+)\b", normalized, re.I)
+            issue_match = re.search(r"\b(?:issue|no\.?)\s+([A-Za-z0-9.-]+)\b", normalized, re.I)
             if issue_match:
                 issue = issue_match.group(1)
                 if not re.search(r"\b(has|for|with|and|the|of|limits?)\b", issue, re.I):
                     info["issue"] = issue
         if not info["pages"]:
-            pages_match = re.search(r"\b(?:pp?\.?|pages?)\s*([A-Za-z]?\d+(?:[-−–]\d+)?)\b", normalized, re.I)
+            pages_match = re.search(r"\b(?:pp?\.?|pages?|article\s*(?:number|no\.?)?)\s*([A-Za-z]?\d+(?:[-−–]\d+)?)\b", normalized, re.I)
             if pages_match:
                 info["pages"] = pages_match.group(1).replace("−", "-").replace("–", "-")
         if not info["pages"]:
@@ -590,7 +853,9 @@ class PDFParser:
                 continue
             if len(text) < 180 or y0 < 180 or y0 > 460:
                 continue
-            if x0 < 150:
+            # Skip full-width banners/headers; keep normal column-width paragraphs
+            para_width = x1 - x0
+            if para_width > 380 or x0 < 5 or x1 > 590:
                 continue
             candidates.append(para)
         if not candidates:
@@ -651,7 +916,7 @@ class PDFParser:
                 if current.paragraphs or current.section_title != "正文":
                     sections.append(current)
                 title, remainder = self._split_inline_heading(para.text_original)
-                current = Section(section_title=title)
+                current = Section(section_title=title, heading_level=para.heading_level or 1)
                 in_references = bool(re.search(r"^(references|bibliography|notes and references)\b", title, re.I))
                 if remainder and not in_references:
                     para.kind = "paragraph"
@@ -673,7 +938,7 @@ class PDFParser:
                         self._append_paragraph(current, before_para)
                     if current.paragraphs or current.section_title != "正文":
                         sections.append(current)
-                    current = Section(section_title=embedded_title)
+                    current = Section(section_title=embedded_title, heading_level=1)
                     para.text_original = after
                     para.kind = "paragraph"
                     if after:
@@ -780,6 +1045,23 @@ class PDFParser:
         )
         if extended:
             return extended.group(1), extended.group(2).strip()
+        # Detect leading subheading: capitalized phrase of 3-10 words that ends with a lowercase letter
+        # or dash, followed by body text starting with a capital letter or "We"/"The"/"Our" etc.
+        # Examples: "AI-guided design of stable PSCs We introduce..."
+        #           "Device performance and stability assessment For designing..."
+        # May have no space between heading and body: "PSCsWe" → split at "PSCs" + "We"
+        leading = re.match(
+            r"^([A-Z][A-Za-z0-9\-–\s]{15,110}?(?:SCs|PSCs|SAMs|PCE|HTM|ETL|HTL|perovskite|stability"
+            r"|performance|characterization|assessment|design|fabrication|analysis|evaluation|properties"
+            r"|interface|structure|device|cell|film|layer|materials|efficiency|optimization"
+            r"|backbone|molecule|absorber|transport|contact|electrode|substrate))\s*"
+            r"(We\s|[A-Z][a-z]{2,}|For\s|The\s|Our\s|This\s|Here\b|In\s|A\s|These\s|Their\s|It\s)",
+            text,
+        )
+        if leading:
+            title = leading.group(1).strip()
+            remainder = text[leading.end(1):].strip()
+            return title, remainder
         return text, ""
 
     def _split_embedded_heading(self, text: str) -> tuple[str, str, str] | None:
