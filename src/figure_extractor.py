@@ -296,6 +296,7 @@ class FigureExtractor:
 
     def _find_embedded_images(self, page: fitz.Page, min_size: float = 120.0) -> list[dict]:
         images: list[dict] = []
+        page_rect = page.rect
         try:
             for img_info in page.get_images(full=True):
                 try:
@@ -304,6 +305,11 @@ class FigureExtractor:
                     continue
                 w, h = bbox.width, bbox.height
                 if bbox.is_empty or w < min_size or h < min_size:
+                    continue
+                # Sanity check: bbox must be within page bounds and not occupy > 80% of page
+                bbox_pct = (w * h) / (page_rect.width * page_rect.height)
+                if bbox_pct > 0.85:
+                    self.logger.debug("Skipping image that occupies %.0f%% of page", bbox_pct * 100)
                     continue
                 images.append({
                     "bbox": [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
@@ -318,7 +324,10 @@ class FigureExtractor:
     def _find_drawings(self, page: fitz.Page, min_size: float = 80.0) -> list[list[float]]:
         page_rect = page.rect
         page_w, page_h = page_rect.width, page_rect.height
-        drawings = page.get_drawings()
+        try:
+            drawings = page.get_drawings()
+        except Exception:
+            return []
         bboxes: list[list[float]] = []
         for drawing in drawings:
             rect = drawing.get("rect")
@@ -376,6 +385,14 @@ class FigureExtractor:
             return (None, "heuristic")
         candidates.sort(key=lambda c: c[1], reverse=True)
         best_bbox, _area, source = candidates[0]
+        # Validate the candidate: ensure it's not too far from the caption
+        best_y1 = best_bbox[3]
+        if best_y1 > cap_y0 + page_height * 0.4:
+            self.logger.debug(
+                "Content-figure candidate is too far from caption (y1=%.1f vs cap_y0=%.1f); falling back to heuristic",
+                best_y1, cap_y0,
+            )
+            return (None, "heuristic")
         padded = self._pad_bbox(best_bbox, page.rect)
         return (padded, source)
 
@@ -395,6 +412,14 @@ class FigureExtractor:
             if existing is None:
                 by_id[key] = fig
                 continue
-            if fig.image_base64 and not existing.image_base64:
+            # Prefer the entry with image data; if both have image data, keep the one
+            # with a larger base64 payload (more detail).
+            existing_has = bool(existing.image_base64)
+            fig_has = bool(fig.image_base64)
+            if fig_has and not existing_has:
                 by_id[key] = fig
+            elif fig_has and existing_has and len(fig.image_base64) > len(existing.image_base64) * 1.1:
+                # New one has significantly more image data – use it instead
+                by_id[key] = fig
+            # Keep existing otherwise (first seen wins in a tie)
         return list(by_id.values())

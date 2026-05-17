@@ -1004,19 +1004,56 @@ class PDFParser:
         return False
 
     def _starts_known_subheading(self, text: str) -> bool:
+        """Check if text looks like a subheading based on structural patterns.
+
+        Used to prevent incorrect paragraph merging when a paragraph starts with
+        a subheading-like phrase. Uses general heuristics instead of hardcoded
+        domain-specific titles.
+
+        A subheading is:
+        - 2-14 words, starts with uppercase
+        - NOT a complete sentence (no period/question at end)
+        - NOT starting with article/pronoun (We/The/Our/This...)
+        - Either numbered (e.g. "2.1 Materials"), or
+        - Ends with a technical noun keyword, or
+        - Is a short Title Case phrase (2-6 words, first and last capitalized)
+        """
         if not text or text[0].islower():
             return False
-        return bool(
-            re.match(
-                r"^(Barrier energy quantification|Scattering barrier preparation|Drift barrier preparation|"
-                r"Photovoltaic performance|Inhibition effect for iodide ion migration|Materials|"
-                r"Perovskite solar cells fabrication|Stability tests|Relative dielectric constant|"
-                r"Carrier concentration characterization|Space charge limited current|SCAPS simulation|"
-                r"Fitting of Fick|Characterization|Device fabrication|Sample preparation|Materials characterization|"
-                r"Solar cell fabrication|Device characterization|Experimental details|Synthesis)\b",
-                text,
-            )
-        )
+        words = text.split()
+        if len(words) < 2 or len(words) > 14:
+            return False
+        if re.search(r"[.!?。！？]$", text):
+            return False
+        if re.match(
+            r"^(We|The|Our|This|These|A|An|In|On|For|At|By|To|Here|It|Its|They|Their|"
+            r"However|Moreover|Furthermore|Therefore|Nevertheless|Additionally)\b",
+            text,
+        ):
+            return False
+        # Numbered subheading (e.g., "2.1 Materials characterization")
+        if re.match(r"^\d+(?:\.\d+)*\s+[A-Z]", text):
+            return True
+        # Ends with a domain-relevant technical keyword
+        if re.search(
+            r"(characterization|fabrication|preparation|performance|analysis|evaluation|"
+            r"measurement|simulation|calculation|estimation|quantification|assessment|"
+            r"testing|modeling|study|investigation|measurements|tests|properties|"
+            r"diffusion|migration|transport|filling|effect|behavior|mechanism|"
+            r"stability|efficiency|optimization|degradation|passivation|"
+            r"concentration|dielectric|current|discussion|law)\b",
+            text, re.I,
+        ):
+            return True
+        # Short (2-6 word) Title Case phrase: first and last word capitalized.
+        # This catches general subheadings like "Package Description",
+        # "Relative Dielectric Constant", "Space Charge Limited Current" etc.
+        if len(words) <= 6 and re.match(r"^[A-Z]", words[0]) and re.match(r"^[A-Z]", words[-1]):
+            # Ensure at least 2 words have a meaningful length (>2 chars)
+            meaningful = [w for w in words if len(w) > 2 and re.match(r"^[A-Za-z]", w)]
+            if len(meaningful) >= 2:
+                return True
+        return False
 
     def _union_bbox(self, a: list[float], b: list[float]) -> list[float]:
         return [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
@@ -1045,23 +1082,26 @@ class PDFParser:
         )
         if extended:
             return extended.group(1), extended.group(2).strip()
-        # Detect leading subheading: capitalized phrase of 3-10 words that ends with a lowercase letter
-        # or dash, followed by body text starting with a capital letter or "We"/"The"/"Our" etc.
-        # Examples: "AI-guided design of stable PSCs We introduce..."
-        #           "Device performance and stability assessment For designing..."
-        # May have no space between heading and body: "PSCsWe" → split at "PSCs" + "We"
+        # Detect leading subheading: a noun phrase (2-10 words) followed by body text.
+        # Only split if the leading phrase clearly looks like a heading (capitalized, no verb,
+        # ends with a domain-specific noun), and the remainder reads like a new sentence.
+        # Examples: "Device performance and stability assessment For designing..."
+        #           "Materials characterization Figure 1 shows..."
         leading = re.match(
-            r"^([A-Z][A-Za-z0-9\-–\s]{15,110}?(?:SCs|PSCs|SAMs|PCE|HTM|ETL|HTL|perovskite|stability"
-            r"|performance|characterization|assessment|design|fabrication|analysis|evaluation|properties"
-            r"|interface|structure|device|cell|film|layer|materials|efficiency|optimization"
-            r"|backbone|molecule|absorber|transport|contact|electrode|substrate))\s*"
-            r"(We\s|[A-Z][a-z]{2,}|For\s|The\s|Our\s|This\s|Here\b|In\s|A\s|These\s|Their\s|It\s)",
+            r"^([A-Z][A-Za-z0-9\-–\s]{15,100}?(?:characterization|fabrication|preparation|performance|analysis|"
+            r"evaluation|measurement|simulation|calculation|estimation|quantification|assessment|"
+            r"testing|modeling|study|investigation|measurements|tests|properties|"
+            r"diffusion|migration|transport|behavior|mechanism|stability|efficiency|optimization|"
+            r"degradation|passivation|SCs|PSCs|SAMs))\s*"
+            r"(We\s|For\s|The\s|Our\s|This\s|Here\b|In\s|A\s|These\s|Their\s|It\s)",
             text,
         )
         if leading:
             title = leading.group(1).strip()
             remainder = text[leading.end(1):].strip()
-            return title, remainder
+            # Guard against false positives: title must be < 12 words, remainder > 30 chars
+            if len(title.split()) <= 12 and len(remainder) > 30:
+                return title, remainder
         return text, ""
 
     def _split_embedded_heading(self, text: str) -> tuple[str, str, str] | None:

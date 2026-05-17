@@ -207,16 +207,39 @@ def _should_merge_fragment_after_filter(previous, current) -> bool:
 
 
 def _starts_known_subheading(text: str) -> bool:
-    return bool(
-        re.match(
-            r"^(Barrier energy quantification|Scattering barrier preparation|Drift barrier preparation|"
-            r"Photovoltaic performance|Inhibition effect for iodide ion migration|Materials|"
-            r"Perovskite solar cells fabrication|Stability tests|Relative dielectric constant|"
-            r"Carrier concentration characterization|Space charge limited current|SCAPS simulation|"
-            r"Fitting of Fick|Characterization)\b",
-            text,
-        )
-    )
+    """Whether text looks like a subheading based on structural patterns.
+
+    Mirror of PDFParser._starts_known_subheading for cross-module use.
+    """
+    if not text or text[0].islower():
+        return False
+    words = text.split()
+    if len(words) < 2 or len(words) > 14:
+        return False
+    if re.search(r"[.!?。！？]$", text):
+        return False
+    if re.match(
+        r"^(We|The|Our|This|These|A|An|In|On|For|At|By|To|Here|It|Its|They|Their|"
+        r"However|Moreover|Furthermore|Therefore|Nevertheless|Additionally|Meanwhile)\b",
+        text,
+    ):
+        return False
+    if re.match(r"^\d+(?:\.\d+)*\s+[A-Z]", text):
+        return True
+    if re.search(
+        r"(characterization|fabrication|preparation|performance|analysis|evaluation|"
+        r"measurement|simulation|calculation|estimation|quantification|assessment|"
+        r"testing|modeling|study|investigation|measurements|tests|properties|"
+        r"diffusion|migration|transport|filling|effect|behavior|mechanism|"
+        r"stability|efficiency|optimization|degradation|passivation)\b",
+        text, re.I,
+    ):
+        return True
+    if len(words) <= 6 and re.match(r"^[A-Z]", words[0]) and re.match(r"^[A-Z]", words[-1]):
+        meaningful = [w for w in words if len(w) > 2 and re.match(r"^[A-Za-z]", w)]
+        if len(meaningful) >= 2:
+            return True
+    return False
 
 
 def _bbox_overlap_ratio(a: list[float], b: list[float]) -> float:

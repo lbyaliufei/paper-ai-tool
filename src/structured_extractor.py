@@ -337,19 +337,39 @@ class StructuredExtractor:
     def _sentence_around(self, text: str, pos: int) -> str:
         if pos < 0:
             pos = 0
+        # Look backward for sentence boundary (period, question mark, exclamation,
+        # Chinese punctuation, or double newline indicating paragraph break)
         start = 0
         for idx in range(pos - 1, -1, -1):
             char = text[idx]
+            if char == "\n" and idx > 0 and text[idx - 1] == "\n":
+                # Double newline = paragraph break
+                start = idx + 1
+                break
             if char in ".!?。！？" and not self._is_decimal_point(text, idx):
                 start = idx + 1
                 break
+        # Look forward for end of sentence
         end = min(len(text), pos + 320)
         for idx in range(pos, len(text)):
             char = text[idx]
+            if char == "\n" and idx + 1 < len(text) and text[idx + 1] == "\n":
+                # Double newline = paragraph break
+                end = idx
+                break
             if char in ".!?。！？" and not self._is_decimal_point(text, idx):
                 end = idx + 1
                 break
-        return text[start:end].strip(" .;")
+        result = text[start:end].strip(" .;")
+        # If the result is very short (< 40 chars) and there are more content nearby,
+        # try to expand to the next sentence
+        if len(result) < 40 and end < len(text):
+            for idx in range(end, min(len(text), end + 160)):
+                char = text[idx]
+                if char in ".!?。！？" and not self._is_decimal_point(text, idx):
+                    result = text[start:idx + 1].strip(" .;")
+                    break
+        return result
 
     def _is_decimal_point(self, text: str, idx: int) -> bool:
         return (
@@ -400,19 +420,33 @@ class StructuredExtractor:
         )
 
     def _looks_like_finding(self, text: str) -> bool:
-        if len(text) < 50 or len(text) > 500:
+        if len(text) < 60 or len(text) > 500:
             return False
-        patterns = [
-            r"\b(we\s+(?:find|found|show|showed|demonstrate|demonstrated|reveal|revealed|identify|identified|confirm|confirmed|observe|observed|discover|discovered|quantif|quantified|achieve|achieved))",
-            r"\b(it\s+is\s+(?:found|shown|demonstrated|revealed|observed|confirmed|noted)\s+that)",
-            r"\b(the\s+(?:results|findings|data|measurements)\s+(?:indicate|show|demonstrate|reveal|suggest|confirm|highlight|prove|support))",
-            r"\b((?:is|are|was|were)\s+(?:found|shown|demonstrated|revealed|observed|confirmed)\s+to\s+(?:be|exhibit|show|have|possess))",
-            r"\b(these\s+(?:results|findings)\s+(?:indicate|show|demonstrate|reveal|suggest|confirm|highlight))",
-            r"\b(indicating|suggesting|confirming|revealing|demonstrating|highlighting)\s+(?:that\s+)?(?:a|the|an|enhanced|improved|superior|excellent|high|low|strong|weak|significant)",
-            r"\b(?:increased|decreased|improved|enhanced|suppressed|reduced|boosted|achieved|delivered|exhibited|showed|displayed)\s+(?:by\s+)?(?:\d+(?:\.\d+)?\s*%|an?\s+(?:average|maximum|impressive|remarkable|significant))",
-            r"\b(?:led\s+to|resulted\s+in|yielded|enabled|allowed\s+for)\s+(?:an?\s+)?(?:increase|decrease|improvement|enhancement|suppression|reduction|boost)",
-        ]
-        return any(re.search(p, text, re.I) for p in patterns)
+        # Must contain a quantitative or qualitative result with context
+        has_result_word = re.search(
+            r"\b(improved|enhanced|suppressed|reduced|increased|decreased|boosted|achieved|"
+            r"superior|excellent|outstanding|significant|remarkable|notable|prominent|"
+            r"best|highest|lowest|record|unprecedented|breakthrough)\b",
+            text, re.I,
+        )
+        # Must have some form of result-claiming language (we found, our results show, etc.)
+        has_claim = re.search(
+            r"\b(we\s+(?:find|found|show|showed|demonstrat|reveal|identif|confirm|observ|"
+            r"discover|quantif|achiev|present|propos|report|develop|introduc))"
+            r"|(the\s+(?:results|findings|data|measurements|study|work)\s+(?:indicate|show|"
+            r"demonstrate|reveal|suggest|confirm|highlight|prove|establish))"
+            r"|(this\s+(?:work|study|paper|approach|strategy|method)\s+(?:demonstrates|shows|"
+            r"reveals|presents|proposes|introduces|achieves|provides|offers|enables))"
+            r"|(it\s+is\s+(?:found|shown|demonstrated|revealed|observed|confirmed)\s+that)",
+            text, re.I,
+        )
+        if not has_claim:
+            return False
+        if not has_result_word:
+            # If no strong result word, require a numeric finding
+            if not re.search(r"\d+(?:\.\d+)?\s*(?:%|eV|nm|µm|cm|mA|V|K|°C|h)", text):
+                return False
+        return True
 
     def _looks_like_innovation(self, text: str) -> bool:
         if len(text) < 50 or len(text) > 500:

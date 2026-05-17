@@ -277,27 +277,23 @@ code {{ background: #f5f5f5; padding: 1px 4px; }}
         section = section_title.lower()
         if section not in {"results", "methods", "正文"}:
             return "", rendered
-        labels = [
-            "Barrier energy quantification",
-            "Scattering barrier preparation",
-            "Drift barrier preparation",
-            "Photovoltaic performance",
-            "Inhibition effect for iodide ion migration",
-            "Materials",
-            "Perovskite solar cells fabrication",
-            "Stability tests",
-            "Relative dielectric constant",
-            "Carrier concentration characterization",
-            "Space charge limited current (SCLC) characterization",
-            "SCAPS simulation",
-            "Fitting of Fick’s second law of diffusion",
-            "Fitting of Fick's second law of diffusion",
-            "Characterization",
-        ]
-        for label in labels:
-            if original.startswith(label + " "):
-                body = rendered
-                if body.startswith(label):
-                    body = body[len(label) :].strip()
-                return label, body
+        # Detect subheadings using structural patterns rather than hardcoded domain-specific titles.
+        # A subheading is a short (2-14 word) capitalized phrase at the start of a paragraph,
+        # not a complete sentence, followed by a space and then the body text.
+        match = re.match(
+            r"^([A-Z][A-Za-z0-9\-–\s]{3,100}?(?:characterization|fabrication|preparation|performance|analysis|"
+            r"evaluation|measurement|simulation|calculation|estimation|quantification|assessment|"
+            r"testing|modeling|study|investigation|measurements|tests|properties|"
+            r"diffusion|migration|transport|behavior|mechanism|stability|efficiency|optimization|"
+            r"degradation|passivation|SCs|PSCs|SAMs|devices?|cells?|modules?|films?|layers?))\s+"
+            r"([A-Z\"(']|\d)",
+            original,
+        )
+        if match:
+            title = match.group(1).strip()
+            # Verify it looks like a heading: few words, no sentence-ending punctuation
+            words = title.split()
+            if 2 <= len(words) <= 12 and not re.search(r"[.!?。！？]$", title):
+                body = rendered[len(title):].lstrip()
+                return title, body
         return "", rendered

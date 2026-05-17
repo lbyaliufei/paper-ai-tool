@@ -286,7 +286,24 @@ class Translator:
         translated_has_ellipsis = bool(re.search(r"(\.\.\.|…|……)\s*$", dst))
         if translated_has_ellipsis and not source_has_ellipsis:
             return True
-        if len(src) >= 350 and len(dst) < len(src) * 0.22:
+        # Exclude non-translateable content (numbers, formulas, DOIs, units) from length ratio.
+        # Chinese text is usually shorter than English, but very short output is suspicious.
+        non_translate = re.findall(
+            r"\b(?:10\.\d{4,9}/[^\s]+|\d+(?:\.\d+)?\s*(?:%|°C|K|eV|nm|µm|cm|mm|mV|V|mA|mW|h|s|cm2|cm-2))"
+            r"|[A-Z][a-z]{1,5}\d+(?:-\d+)?(?:\s*[A-Z])?"
+            r"|[A-Z]{2,}(?!\w)",
+            src,
+        )
+        sig_len_src = len(src) - sum(len(m) for m in non_translate)
+        sig_len_dst = len(dst) - sum(len(m) for m in non_translate)
+        if sig_len_src <= 0:
+            return False
+        ratio = sig_len_dst / sig_len_src
+        # Chinese text typically ~70% length of English; <30% is suspicious
+        if sig_len_src >= 300 and ratio < 0.30:
+            return True
+        # For shorter texts, use a more lenient threshold
+        if sig_len_src >= 180 and ratio < 0.20:
             return True
         return False
 
